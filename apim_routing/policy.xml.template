@@ -1,0 +1,77 @@
+<policies>
+    <inbound>
+        <base />
+        <set-variable name="deployment-id" value='@(context.Request.MatchedParameters.ContainsKey("deployment-id") ? context.Request.MatchedParameters["deployment-id"] : "")' />
+        <set-variable name="is-embedding" value='@{
+            var deploymentId = (string)context.Variables["deployment-id"];
+            return deploymentId.Contains("embedding") ? "true" : "false";
+        }' />
+        <choose>
+            <when condition='@((string)context.Variables["is-embedding"] == "true")'>
+                <set-variable name="backends" value="__EMBEDDING_BACKENDS__" />
+                <set-variable name="backend-names" value="__EMBEDDING_TOKENS__" />
+                <set-variable name="degraded-routes" value="__EMBEDDING_NAMED__" />
+            </when>
+            <otherwise>
+                <set-variable name="backends" value="__CHAT_BACKENDS__" />
+                <set-variable name="backend-names" value="__CHAT_TOKENS__" />
+                <set-variable name="degraded-routes" value="__CHAT_NAMED__" />
+            </otherwise>
+        </choose>
+        <set-variable name="route-config-valid" value='@{
+            var raw = (string)context.Variables["degraded-routes"];
+            if (raw == "none") { return true; }
+            var allowed = ((string)context.Variables["backend-names"]).Split(new [] { (char)44 });
+            var tokens = raw.Split(new [] { (char)44 });
+            return tokens.All(x => allowed.Contains(x))
+                &amp;&amp; tokens.Distinct().Count() == tokens.Length;
+        }' />
+        <choose>
+            <when condition='@(!(bool)context.Variables["route-config-valid"])'>
+                <return-response>
+                    <set-status code="503" reason="Invalid route configuration" />
+                    <set-header name="Content-Type" exists-action="override">
+                        <value>application/json</value>
+                    </set-header>
+                    <set-body>{"error":{"code":"InvalidRouteConfiguration","message":"The degraded route configuration is invalid."}}</set-body>
+                </return-response>
+            </when>
+        </choose>
+        <set-variable name="backend-count" value='@(((string)context.Variables["backends"]).Split(new [] { (char)44 }).Length)' />
+        <!-- Prefer non-degraded members initially, but retain every member for retry. -->
+        <set-variable name="backend-index" value='@{
+            var names = ((string)context.Variables["backend-names"]).Split(new [] { (char)44 });
+            var degraded = ((string)context.Variables["degraded-routes"]).Split(new [] { (char)44 });
+            var preferred = Enumerable.Range(0, names.Length)
+                .Where(i => !degraded.Contains(names[i])).ToArray();
+            if (preferred.Length == 0) {
+                preferred = Enumerable.Range(0, names.Length).ToArray();
+            }
+            var index = (int)(Math.Abs((long)context.RequestId.GetHashCode()) % preferred.Length);
+            return preferred[index] - 1;
+        }' />
+        <authentication-managed-identity resource="https://cognitiveservices.azure.com" client-id="__UAMI__" output-token-variable-name="msi-access-token" ignore-error="false" />
+        <set-header name="Authorization" exists-action="override">
+            <value>@("Bearer " + (string)context.Variables["msi-access-token"])</value>
+        </set-header>
+        <rewrite-uri template="@{return context.Request.OriginalUrl.Path;}" />
+    </inbound>
+    <backend>
+        <retry condition='@((int)context.Variables["backend-count"] &gt; 1 &amp;&amp; context.Response != null &amp;&amp; (context.Response.StatusCode == 429 || context.Response.StatusCode &gt;= 500))' count="1" interval="1" delta="1" first-fast-retry="true">
+            <set-variable name="backend-index" value='@(((int)context.Variables["backend-index"] + 1) % (int)context.Variables["backend-count"])' />
+            <set-variable name="backend-id" value='@(((string)context.Variables["backends"]).Split(new [] { (char)44 })[(int)context.Variables["backend-index"]])' />
+            <set-variable name="backend-name" value='@(((string)context.Variables["backend-names"]).Split(new [] { (char)44 })[(int)context.Variables["backend-index"]])' />
+            <set-backend-service backend-id='@((string)context.Variables["backend-id"])' />
+            <forward-request buffer-request-body="true" />
+        </retry>
+    </backend>
+    <outbound>
+        <base />
+        <set-header name="X-Backend-Region" exists-action="override">
+            <value>@(context.Variables.GetValueOrDefault&lt;string&gt;("backend-name", "unknown"))</value>
+        </set-header>
+    </outbound>
+    <on-error>
+        <base />
+    </on-error>
+</policies>

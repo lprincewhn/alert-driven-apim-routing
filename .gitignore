@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+config.local.json
+*.local.json
+rendered/
+build/
+.env
+.env.*
+*secret*
+smoke-receipt.json
+*.policy-backup.json
+policy-backups/

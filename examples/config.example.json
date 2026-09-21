@@ -1,0 +1,54 @@
+{
+  "subscription_id": "00000000-0000-0000-0000-000000000000",
+  "controller_resource_group": "replace-controller-rg",
+  "location": "replacewithazurelocation",
+  "workflow_name": "replace-routing-controller",
+  "action_group_name": "replace-routing-alerts",
+  "action_group_short_name": "routealerts",
+  "apim_resource_id": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/replace-apim-rg/providers/Microsoft.ApiManagement/service/replace-existing-apim",
+  "api_id": "replace-existing-api",
+  "uami_client_id": "11111111-1111-1111-1111-111111111111",
+  "threshold_ms": 2000,
+  "window_size": "PT1M",
+  "evaluation_frequency": "PT1M",
+  "groups": {
+    "chat": {
+      "named_value_name": "chat-degraded-routes",
+      "routes": [
+        {
+          "token": "region-a",
+          "backend_id": "replace-chat-backend-a",
+          "foundry_resource_id": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/replace-foundry-rg/providers/Microsoft.CognitiveServices/accounts/replace-foundry-a",
+          "deployment_name": "replace-chat-deployment",
+          "alert_name": "replace-chat-a-latency"
+        },
+        {
+          "token": "region-b",
+          "backend_id": "replace-chat-backend-b",
+          "foundry_resource_id": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/replace-foundry-rg/providers/Microsoft.CognitiveServices/accounts/replace-foundry-b",
+          "deployment_name": "replace-chat-deployment",
+          "alert_name": "replace-chat-b-latency"
+        }
+      ]
+    },
+    "embedding": {
+      "named_value_name": "embedding-degraded-routes",
+      "routes": [
+        {
+          "token": "region-c",
+          "backend_id": "replace-embedding-backend-c",
+          "foundry_resource_id": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/replace-foundry-rg/providers/Microsoft.CognitiveServices/accounts/replace-foundry-c",
+          "deployment_name": "replace-embedding-deployment",
+          "alert_name": "replace-embedding-c-latency"
+        },
+        {
+          "token": "region-d",
+          "backend_id": "replace-embedding-backend-d",
+          "foundry_resource_id": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/replace-foundry-rg/providers/Microsoft.CognitiveServices/accounts/replace-foundry-d",
+          "deployment_name": "replace-embedding-deployment",
+          "alert_name": "replace-embedding-d-latency"
+        }
+      ]
+    }
+  }
+}
