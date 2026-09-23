@@ -69,7 +69,7 @@ Fired 事件要求指标大于相应阈值，时间位于过去 30 分钟至未�
 | aggregation | `Average` |
 | operator | `GreaterThan` |
 | 默认 threshold | 2000 ms |
-| window / evaluation | PT1M / PT1M |
+| window / evaluation | 由 `window_size` / `evaluation_frequency` 配置；省略时 PT1M / PT1M，示例 PT5M / PT1M；评估间隔不大于窗口 |
 | autoMitigate | 告警自身允许进入 Resolved，不清除路由降级 |
 
 这里的“整体时延”是服务暴露的原生 TTLT 边界，不是网络、APIM、重试和客户端读取时间的简单总和。它也不是 TTFT。低流量下缺少额外最小样本门槛，单个长请求可能影响一分钟平均值；高流量下短请求可能稀释长请求影响。
@@ -78,7 +78,7 @@ Fired 事件要求指标大于相应阈值，时间位于过去 30 分钟至未�
 
 ## 通知与失败
 
-钉钉文本含 `Azure`、组、成员、结果、时延和可获得的名单前后值。仅在 HTTP 成功且业务 `errcode=0` 时认定通知成功。
+钉钉通知使用中文，包含 `Azure`、业务类型、区域、处理结果、平均总响应时延（毫秒）和可获得的名单前后值。更新成功、重复降级、告警恢复但不自动恢复路由、控制器失败分别给出中文说明；区域标识和错误代码保留原值便于排查。生成的 JSON 使用 UTF-8 可读中文，不转换为 Unicode 转义序列。HTTP 响应中的机器状态码保持不变。仅在 HTTP 成功且业务 `errcode=0` 时认定通知成功。
 
 | 名单写入 | 通知 | 结果 |
 |---|---|---|
@@ -89,7 +89,7 @@ Fired 事件要求指标大于相应阈值，时间位于过去 30 分钟至未�
 
 HTTP 触发器的异步接收成功不是整体处理成功。必须检查运行、写入动作和通知完成状态。
 
-`dingtalkWebhook` 使用无默认值的 `SecureString`，通知 HTTP 动作启用安全输入/输出。Webhook 和 Action Group 使用的 Logic App callback URL 都不能放进仓库或公开日志。本实现不提供每次请求动态生成钉钉 HMAC 签名；固定带时间戳的签名 URL 不适用于长期部署。
+`dingtalkWebhook` 使用 `SecureString`，定义中的 `defaultValue` 为占位字符串 `"none"`，不是真实 Webhook，也不是关闭通知的开关。部署时必须通过 `properties.parameters.dingtalkWebhook.value` 注入真实地址；未配置时通知不能成功，运行会报告失败。通知 HTTP 动作启用安全输入/输出。Webhook 和 Action Group 使用的 Logic App callback URL 都不能放进仓库或公开日志。本实现不提供每次请求动态生成钉钉 HMAC 签名；固定带时间戳的签名 URL 不适用于长期部署。
 
 ## 权限与最小影响范围
 

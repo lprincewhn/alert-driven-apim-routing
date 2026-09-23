@@ -290,11 +290,22 @@ def definition(config):
             "body": {
                 "msgtype": "text",
                 "text": {
-                    "content": "@concat('Azure APIM ', variables('Group'), '/', variables('Region'), "
-                               "' outcome=', variables('Outcome'), ' TTLT Average=', variables('Metric'), 'ms', "
-                               "if(empty(variables('Before')), '', concat(' before=', variables('Before'))), "
-                               "if(empty(variables('After')), '', concat(' after=', variables('After'))), "
-                               "if(variables('ControllerFailed'), concat(' error=', variables('ErrorCode')), ''))",
+                    "content": "@concat('Azure APIM 路由告警', decodeUriComponent('%0A'), "
+                               "'业务类型：', if(equals(variables('Group'), 'chat'), '对话', '向量嵌入'), "
+                               "'；区域：', variables('Region'), decodeUriComponent('%0A'), "
+                               "'处理结果：', "
+                               "if(equals(variables('Outcome'), 'Updated'), '已加入降级名单', "
+                               "if(equals(variables('Outcome'), 'AlreadyDegraded'), '已在降级名单中，无需重复更新', "
+                               "if(equals(variables('Outcome'), 'ResolvedIgnored'), '告警已恢复，保留降级标记，需人工恢复路由', "
+                               "if(equals(variables('Outcome'), 'ControllerFailed'), '路由控制器处理失败，请检查权限、ETag 和运行记录', "
+                               "variables('Outcome'))))), decodeUriComponent('%0A'), "
+                               "'平均总响应时延（TTLT）：', variables('Metric'), ' 毫秒', "
+                               "if(empty(variables('Before')), '', concat(decodeUriComponent('%0A'), "
+                               "'变更前降级名单：', if(equals(variables('Before'), 'none'), '无', variables('Before')))), "
+                               "if(empty(variables('After')), '', concat(decodeUriComponent('%0A'), "
+                               "'变更后降级名单：', if(equals(variables('After'), 'none'), '无', variables('After')))), "
+                               "if(variables('ControllerFailed'), concat(decodeUriComponent('%0A'), "
+                               "'错误代码：', variables('ErrorCode'), '；名单最终状态请以 APIM 为准，不会自动回滚。'), ''))",
                 },
             },
         },
@@ -370,7 +381,7 @@ def definition(config):
     return {
         "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
         "contentVersion": "1.0.0.0",
-        "parameters": {"dingtalkWebhook": {"type": "SecureString"}},
+        "parameters": {"dingtalkWebhook": {"defaultValue": "none", "type": "SecureString"}},
         "triggers": {
             "receive": {
                 "type": "Request", "kind": "Http",

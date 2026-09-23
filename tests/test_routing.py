@@ -51,7 +51,10 @@ class ConfigurationTests(unittest.TestCase):
         data = config()
         for key in ("threshold_ms", "window_size", "evaluation_frequency"):
             del data[key]
-        self.assertEqual(validate(data)["threshold_ms"], 2000)
+        validated = validate(data)
+        self.assertEqual(validated["threshold_ms"], 2000)
+        self.assertEqual(validated["window_size"], "PT1M")
+        self.assertEqual(validated["evaluation_frequency"], "PT1M")
 
     def test_unknown_keys_and_secrets_rejected(self):
         for key in ("webhook", "token", "password", "typo"):
@@ -69,12 +72,38 @@ class ConfigurationTests(unittest.TestCase):
                 with self.assertRaises(ConfigError):
                     validate(data)
 
-    def test_fixed_windows_and_groups(self):
-        for key in ("window_size", "evaluation_frequency"):
-            data = config()
-            data[key] = "PT5M"
-            with self.assertRaises(ConfigError):
-                validate(data)
+    def test_alert_timing_combinations(self):
+        windows = {"PT1M": 1, "PT5M": 5, "PT15M": 15, "PT30M": 30,
+                   "PT1H": 60, "PT6H": 360, "PT12H": 720, "P1D": 1440}
+        frequencies = {"PT1M": 1, "PT5M": 5, "PT10M": 10,
+                       "PT15M": 15, "PT30M": 30, "PT1H": 60}
+        for window, window_minutes in windows.items():
+            for frequency, frequency_minutes in frequencies.items():
+                with self.subTest(window=window, frequency=frequency):
+                    data = config()
+                    data.update(window_size=window, evaluation_frequency=frequency)
+                    if frequency_minutes > window_minutes:
+                        with self.assertRaisesRegex(ConfigError, "must not exceed"):
+                            validate(data)
+                    else:
+                        self.assertEqual(validate(data)["window_size"], window)
+                        for _, route in routes(data):
+                            properties = alert(data, route)["properties"]
+                            self.assertEqual(properties["windowSize"], window)
+                            self.assertEqual(properties["evaluationFrequency"], frequency)
+
+    def test_invalid_alert_timing(self):
+        for key, unsupported in (("window_size", "PT10M"),
+                                 ("evaluation_frequency", "PT6H")):
+            for value in (unsupported, "", "PT0M", "PT2M", "pt5m", "PT60S",
+                          None, True, 5, [], {}):
+                with self.subTest(key=key, value=value):
+                    data = config()
+                    data[key] = value
+                    with self.assertRaisesRegex(ConfigError, key + " must be one of"):
+                        validate(data)
+
+    def test_fixed_groups(self):
         data = config()
         data["groups"]["chat"]["routes"].pop()
         with self.assertRaises(ConfigError):
@@ -159,7 +188,8 @@ class GeneratorTests(unittest.TestCase):
         for expected in ("-30", "utcNow(), 2", "GreaterThan", "Average", "AzureOpenAITTLTInMS"):
             self.assertIn(expected, dumped)
         self.assertEqual(workflow["triggers"]["receive"]["runtimeConfiguration"]["concurrency"]["runs"], 1)
-        self.assertEqual(workflow["parameters"]["dingtalkWebhook"], {"type": "SecureString"})
+        self.assertEqual(workflow["parameters"]["dingtalkWebhook"],
+                         {"defaultValue": "none", "type": "SecureString"})
         actions = list(walk(workflow))
         dingtalk = [a for a in actions if a.get("type") == "Http"
                     and a["inputs"].get("uri") == "@parameters('dingtalkWebhook')"][0]
@@ -168,6 +198,28 @@ class GeneratorTests(unittest.TestCase):
         self.assertEqual(len(writes), 1)
         self.assertEqual(writes[0]["inputs"]["retryPolicy"], {"type": "none"})
         self.assertEqual(writes[0]["inputs"]["headers"], {"If-Match": "@outputs('Read_etag')"})
+
+    def test_dingtalk_notification_is_chinese_without_changing_response_codes(self):
+        workflow = definition(config())
+        notify = workflow["actions"]["Notify"]
+        message = notify["actions"]["DingTalk"]["inputs"]["body"]["text"]["content"]
+        for expected in (
+            "Azure APIM 路由告警", "业务类型：", "对话", "向量嵌入", "区域：",
+            "已加入降级名单", "已在降级名单中，无需重复更新",
+            "告警已恢复，保留降级标记，需人工恢复路由",
+            "路由控制器处理失败", "平均总响应时延（TTLT）：", "毫秒",
+            "变更前降级名单：", "变更后降级名单：", "错误代码：",
+            "名单最终状态请以 APIM 为准", "decodeUriComponent('%0A')",
+        ):
+            self.assertIn(expected, message)
+        for outcome in ("Updated", "AlreadyDegraded", "ResolvedIgnored", "ControllerFailed"):
+            self.assertIn(f"equals(variables('Outcome'), '{outcome}')", message)
+        self.assertNotIn(" outcome=", message)
+        self.assertEqual(notify["expression"], "@variables('Accepted')")
+        response = workflow["actions"]["Respond"]["inputs"]["body"]
+        self.assertEqual(response["outcome"], "@variables('Outcome')")
+        self.assertEqual(response["result"],
+                         "@if(variables('NotificationFailed'), 'NotificationFailed', variables('Outcome'))")
 
     def test_rules_all_resources_parameterized(self):
         data = config()
@@ -184,6 +236,7 @@ class GeneratorTests(unittest.TestCase):
             self.assertFalse(props["enabled"])
             self.assertEqual(props["scopes"], [route["foundry_resource_id"]])
             self.assertEqual(props["evaluationFrequency"], "PT1M")
+            self.assertEqual(props["windowSize"], "PT5M")
             metric = props["criteria"]["allOf"][0]
             self.assertEqual(metric["threshold"], 2000)
             self.assertEqual(metric["dimensions"][0]["values"], [route["deployment_name"]])
@@ -193,8 +246,25 @@ class GeneratorTests(unittest.TestCase):
         try:
             with patch.dict("os.environ", {"DINGTALK_WEBHOOK": "SENSITIVE-SENTINEL"}), \
                     patch("subprocess.run", side_effect=AssertionError("No external commands")):
-                files = render(config(), destination)
+                data = config()
+                data.update(window_size="PT1H", evaluation_frequency="PT10M")
+                files = render(validate(data), destination)
             self.assertEqual(len(files), 4)
+            manifest = json.loads((destination / "manifest.json").read_text())
+            self.assertEqual(manifest["window_size"], "PT1H")
+            self.assertEqual(manifest["evaluation_frequency"], "PT10M")
+            alerts = json.loads((destination / "alerts.json").read_text())
+            self.assertEqual(len(alerts), 4)
+            for item in alerts.values():
+                self.assertEqual(item["properties"]["windowSize"], "PT1H")
+                self.assertEqual(item["properties"]["evaluationFrequency"], "PT10M")
+                self.assertFalse(item["properties"]["enabled"])
+            workflow_text = (destination / "workflow.json").read_text(encoding="utf-8")
+            self.assertEqual(json.loads(workflow_text), definition(config()))
+            self.assertIn("Azure APIM 路由告警", workflow_text)
+            self.assertNotIn("\\u8def", workflow_text)
+            self.assertEqual(json.loads(workflow_text)["parameters"]["dingtalkWebhook"],
+                             {"defaultValue": "none", "type": "SecureString"})
             for file in destination.iterdir():
                 self.assertNotIn("SENSITIVE-SENTINEL", file.read_text())
         finally:
