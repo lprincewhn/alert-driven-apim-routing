@@ -18,6 +18,13 @@ RESOURCE = re.compile(
     r"^/subscriptions/([0-9a-fA-F-]{36})/resourceGroups/([^/]+)/providers/"
     r"([^/]+)/([^/]+)/([^/]+)$", re.I
 )
+WINDOW_MINUTES = {
+    "PT1M": 1, "PT5M": 5, "PT15M": 15, "PT30M": 30,
+    "PT1H": 60, "PT6H": 360, "PT12H": 720, "P1D": 1440,
+}
+EVALUATION_MINUTES = {
+    "PT1M": 1, "PT5M": 5, "PT10M": 10, "PT15M": 15, "PT30M": 30, "PT1H": 60,
+}
 
 
 def require(condition, message):
@@ -74,8 +81,13 @@ def validate(data):
     threshold = data.setdefault("threshold_ms", 2000)
     require(type(threshold) in (int, float) and math.isfinite(threshold) and 0 < threshold <= 86400000,
             "threshold_ms must be a finite positive number no greater than one day")
-    for key in ("window_size", "evaluation_frequency"):
-        require(data.setdefault(key, "PT1M") == "PT1M", key + " supports only PT1M")
+    for key, choices in (("window_size", WINDOW_MINUTES),
+                         ("evaluation_frequency", EVALUATION_MINUTES)):
+        value = data.setdefault(key, "PT1M")
+        require(isinstance(value, str) and value in choices,
+                key + " must be one of: " + ", ".join(choices))
+    require(EVALUATION_MINUTES[data["evaluation_frequency"]] <= WINDOW_MINUTES[data["window_size"]],
+            "evaluation_frequency must not exceed window_size")
     keys(data["groups"], ("chat", "embedding"))
     alerts, named = [], []
     for group, spec in data["groups"].items():

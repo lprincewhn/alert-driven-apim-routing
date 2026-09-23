@@ -71,5 +71,5 @@ def render(config, directory):
     artifacts = {"workflow.json": definition(config), "manifest.json": manifest(config),
                  "alerts.json": {alert_id(config, r): alert(config, r) for _, r in routes(config)}}
     for filename, value in artifacts.items():
-        (directory / filename).write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+        (directory / filename).write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     return list(artifacts) + ["policy.xml"]

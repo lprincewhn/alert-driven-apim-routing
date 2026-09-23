@@ -9,7 +9,7 @@
   "api_id": "replace-existing-api",
   "uami_client_id": "11111111-1111-1111-1111-111111111111",
   "threshold_ms": 2000,
-  "window_size": "PT1M",
+  "window_size": "PT5M",
   "evaluation_frequency": "PT1M",
   "groups": {
     "chat": {

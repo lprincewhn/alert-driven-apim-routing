@@ -1,187 +1,262 @@
 # 部署步骤
 
-本指南部署的是**告警触发路由更新链路**，不是 APIM 或 Foundry 基础设施。所有命令均在仓库根目录执行；不要把示例中的占位值直接用于 Azure。
+按下面六步部署告警驱动 APIM 路由方案。**脚本只用于离线生成定义；Named Value、APIM 策略、Logic App、Action Group、四条告警分别发布，不运行一次性 `deploy` 命令。** 每个写入步骤先审阅、确认，再执行；不能把本文当成可整段运行的脚本。
 
-## 外部资源前置
+本文适用于 Azure Public Cloud、Logic Apps Consumption。APIM、API/操作、backend、用户分配托管身份（UAMI）、Foundry 账户/模型部署及资源组均为外部既有资源，不由本文创建。需准备 Python 3.9+、Azure CLI、`jq`，并在操作者自己的终端登录 Azure。命令在仓库根目录的 Bash 中执行，显式指定订阅，不切换共享机器的默认账户或订阅。
 
-操作者应已经具备：
+真实配置、生成文件和环境快照不提交 Git。Webhook、回调 URL、订阅密钥和令牌不贴到评论、不放在命令参数或日志中；请求体含秘密时限制文件权限，用后清理，不作为附件分享。
 
-| 外部资源 | 要求 |
+## 1. 将 APIM 及相关资源信息更新到 config.local.json
+
+首次配置时复制示例；已有本地配置不要覆盖：
+
+```bash
+umask 077
+test ! -e config.local.json && cp examples/config.example.json config.local.json
+```
+
+编辑 `config.local.json`，将占位值替换为实际环境信息：
+
+| 配置项 | 填写内容 |
 |---|---|
-| APIM 服务 | 已存在；具备托管身份和本方案所用策略能力 |
-| APIM API | 已存在；允许显式替换 API 级策略，并已备份旧策略 |
-| API 操作 | 聊天与 Embedding 的 POST 操作，路径含必填参数 `deployment-id` |
-| APIM backend | 每个候选的 backend ID 已存在，URL 指向对应 Foundry 账户 |
-| APIM UAMI | 已关联到 APIM，其 client ID 可供策略引用 |
-| Foundry 账户与部署 | 已存在，每组两个候选均提供一致的 URL 部署名称 |
-| 模型数据权限 | APIM UAMI 已获对应 Foundry 账户的推理权限 |
-| 控制资源组 | 已存在，用来放置工作流、Action Group、告警 |
-| 钉钉机器人 | 接受包含 `Azure` 的文本，持有可长期使用的 Webhook |
+| `subscription_id`、`controller_resource_group`、`location` | 控制资源所在订阅、已有资源组和工作流区域 |
+| `apim_resource_id`、`api_id` | 现有 APIM 完整资源 ID、现有 API ID |
+| `uami_client_id` | 已关联到 APIM 的 UAMI client ID，不是 principal/object ID |
+| `workflow_name` | 要创建的控制器 Logic App 名称 |
+| `action_group_name`、`action_group_short_name` | Action Group 名称和不超过 12 字符的短名称 |
+| `groups.chat`、`groups.embedding` | 各自的 `named_value_name` 及恰好两个 `routes` |
+| 每条 route | `token`、已有 `backend_id`、`foundry_resource_id`、`deployment_name`、唯一 `alert_name` |
+| `threshold_ms` | 四条告警共用的 TTLT 阈值，默认 2000 ms；第五步依据历史数据确定正式值 |
+| `window_size`、`evaluation_frequency` | 分别生成告警的 `windowSize`、`evaluationFrequency`；示例为 `PT5M` / `PT1M`，省略时均默认 `PT1M`；可选值见第五步 |
 
-本仓库不创建上表中的资源，不部署模型，不给 APIM 分配身份或授予模型数据权限。API 订阅校验方式由现有 API 配置决定；本方案不能替代调用方认证。
-
-默认策略期望聊天和 Embedding 的 URL 分别采用：
+确认 API 有下列 POST 操作，路径参数名为 `deployment-id`：
 
 ```text
-POST /openai/deployments/{deployment-id}/chat/completions
-POST /openai/deployments/{deployment-id}/embeddings
+/openai/deployments/{deployment-id}/chat/completions
+/openai/deployments/{deployment-id}/embeddings
 ```
 
-路径参数中包含小写 `embedding` 的部署被分到 Embedding 组。部署命名不满足这个约定时，必须先明确调整策略分类，不能指望仅配置模型名称就自动改变分类规则。
+同组两个成员的模型部署名必须相同，因为策略不改写部署名。Embedding 部署名必须包含小写 `embedding`，聊天部署名不能包含它；不满足时需先调整并审阅分类策略。backend 必须指向对应 Foundry 的 HTTPS 根端点，不能附加路径或冲突的 API key/Authorization 凭据。APIM UAMI 必须已有各 Foundry 账户的推理权限。
 
-## 工具与授权
+`token` 是稳定路由标识，必须与 Named Value 中的名单成员一致。已有名单需核对语义：本方案是 **degraded（降级）名单**，不是旧版 enabled（可用）名单。
 
-使用 Python 3.9 或更高版本和 Azure CLI；生成器及部署器只依赖 Python 标准库。当前实现针对 Azure Public Cloud、Logic Apps Consumption。通过 `az login` 在操作者自己的终端登录，并确认具有目标资源的权限。命令显式使用配置中的订阅，不应为了部署改变其他用户共享的默认上下文。
+**本步完成条件：**配置中的资源确实存在、模型部署就绪、身份及路径匹配；不只是在 JSON 中填完字符串。
 
-部署权限与授权权限分开：
-
-1. 控制资源部署需要相应资源写入权限。
-2. APIM Named Value 创建/更新与策略安装需要对应子资源权限。
-3. 角色分配需要 `Microsoft.Authorization/roleAssignments/write`；Contributor 不包含该权限。
-4. 工作流系统身份只需要两个 Named Value 精确范围内的读写能力。
-5. APIM UAMI 的 Foundry 模型权限由外部资源负责人准备。
-
-## 安全发布顺序
-
-先离线校验与渲染，再备份和进入维护窗口。控制器部署、角色授权、API 策略安装与告警启用是分开的动作，不能把部署成功理解为流量已经安全切换。
-
-现有工作流或告警的更新需要暂停告警并排空运行；任何权限错误、外部资源不匹配或渲染失败都应停止。不要扩大到整个订阅授权，也不要绕过模型身份授权。
-
-## 配置与离线生成
-
-复制示例到 Git 忽略的本地配置文件，按外部资源清单填入真实值：
+## 2. 调用脚本生成资源定义
 
 ```bash
-cp examples/config.example.json config.local.json
-python3 -m apim_routing --config config.local.json validate
-python3 -m apim_routing --config config.local.json render --output-dir rendered
+python3 -B -m apim_routing --config config.local.json validate
+python3 -B -m apim_routing --config config.local.json render --output-dir rendered
 ```
 
-`validate` 和 `render` 不访问 Azure，也不会验证资源是否真的存在。示例中的零 UUID、`replace-*` 名称仅用于展示结构；离线通过不意味着示例可部署。`rendered/` 含环境标识，默认不提交。
+这两个命令只在本地运行，不访问或修改 Azure。输出如下：
 
-| 配置项 | 含义 |
+| 文件 | 用途 |
 |---|---|
-| `subscription_id` | 控制资源部署订阅，也是 Azure CLI 获取 ARM token 使用的订阅上下文 |
-| `controller_resource_group`、`location` | 已有控制资源组与工作流区域 |
-| `workflow_name`、`action_group_name`、`action_group_short_name` | 本方案创建/管理的控制资源名称 |
-| `apim_resource_id`、`api_id` | 外部 APIM 完整资源 ID 与现有 API ID |
-| `uami_client_id` | 已关联 APIM 的用户分配托管身份 client ID，不是 object ID |
-| `threshold_ms` | 四条规则共同使用的原生时延阈值，默认 2000；两组仍是独立规则 |
-| `window_size`、`evaluation_frequency` | 当前只支持 `PT1M` / `PT1M` |
-| `groups.chat`、`groups.embedding` | 各自的 `named_value_name` 与恰好两个 `routes` |
-| route 的 `token` | 名单成员和响应头使用的稳定 token，不要求为真实区域名 |
-| route 的 `backend_id` | 已有 APIM backend ID，不创建或修改 backend |
-| route 的 `foundry_resource_id` | 已有 Foundry 账户完整资源 ID |
-| route 的 `deployment_name` | 指标维度使用的模型部署名；组内两个成员必须相同 |
-| route 的 `alert_name` | 唯一告警名称，生成器同步到控制器白名单 |
+| `rendered/policy.xml` | 安装到 APIM API 级别的完整策略 |
+| `rendered/workflow.json` | Logic App 流程代码（WDL definition），不是完整 ARM 资源请求体 |
+| `rendered/alerts.json` | 四条告警的“完整资源 ID → 请求体”映射，不是 ARM 部署模板 |
+| `rendered/manifest.json` | 资源 ID、阈值及配置摘要 |
 
-外部 backend 应直接指向该 Foundry 账户的 HTTPS 根端点，不附加路径、查询或其他服务的目标地址。资源命名和格式限制以校验错误为准。渲染后审阅 policy 中的候选、身份和 Named Value 引用，以及工作流的规则映射。
+审核候选后端、身份、Named Value 引用和四条告警映射。`workflow.json` 的 `Rule_map` 已填入环境资源，`dingtalkWebhook` 声明为 `{"defaultValue": "none", "type": "SecureString"}`；`none` 仅为非秘密占位值，不能发送通知，真实秘密必须在第四步通过 `properties.parameters.dingtalkWebhook.value` 注入。钉钉通知及生成文件中的文本使用可读中文。保留 `@parameters(...)`、`@outputs(...)` 等运行时表达式，不要手动替换它们。
 
-## 部署控制资源
+**配置改变后重新生成并审阅所有相关定义。** 特别是阈值同时写入 `alerts.json` 和 `workflow.json` 的事件校验表达式，不能只改告警文件。
 
-先在自己的终端登录 Azure：
+## 3. 审核 policy.xml、添加 Named Value、更新 APIM 策略并手动验证
 
-```bash
-az login
-python3 -m apim_routing --config config.local.json deploy
+### 维护窗口与备份
+
+**这一步可能立即影响生产环境流量，不必等到告警启用才生效。** 事先通知业务负责人，约定维护窗口、验证请求预算、停止条件和回滚负责人。迁移已有链路时先暂停相关告警和自动写入者，排空工作流运行；不要与真实事故处置并行修改名单。
+
+保存当前 API policy、两份名单及 ETag、后端映射和告警状态到受限、未提交的目录。原策略可能含秘密。审核认证、配额、审计、操作级策略和继承关系；本模板会替换 API 级策略，不能自动合并，尤其 `backend` 段没有 `<base />`，不能假定父级 backend 逻辑仍会执行。
+
+### 添加两份 Named Value
+
+使用配置中两个 `named_value_name`，要求 `displayName` 与名称相同、`secret=false`、非 Key Vault 引用。**只创建缺失项**，新建初值为 `none`；已有合法值保留，不借部署清空降级状态。
+
+在 Portal 的 APIM → Named values 中逐项创建；或对每个缺失资源单独发送 ARM PUT：
+
+```text
+PUT {apim_resource_id}/namedValues/{named_value_name}?api-version=2024-05-01
+If-None-Match: *
+{"properties":{"displayName":"与 named_value_name 相同","secret":false,"value":"none"}}
 ```
 
-交互部署会隐藏输入提示，要求提供钉钉 Webhook。非交互运行可通过秘密管理工具注入 `DINGTALK_WEBHOOK` 环境变量；不要把实际 URL 写进命令行、配置、CI YAML、shell 历史或仓库。
+上面是请求结构说明，不是可原样提交的占位请求。
+
+### 更新 API 级策略
+
+可在 APIM → APIs → 目标 API → All operations → 策略代码编辑器中安装审核后的 `policy.xml`。**先备份，再保存，不要安装到服务全局或错误的操作级作用域。**
+
+若采用项目的单独策略安装命令：
 
 ```bash
-# 环境变量由外部秘密管理机制提供；此处不展示或回显其值。
-python3 -m apim_routing --config config.local.json deploy \
-  --webhook-env DINGTALK_WEBHOOK
-```
-
-部署读取并核对外部资源；创建缺失的两份名单（初始 `none`），保留已有名单值；创建/更新系统身份工作流和 Action Group，并创建四条**禁用**的告警。工作流 secret 参数只在请求内传递，不写入渲染文件。策略安装不是此命令的一部分。
-
-更新已有工作流前会禁用告警和工作流，发现仍有在途运行则停止。原本启用的工作流只在部署完整成功后恢复；原本禁用的保持禁用。部分失败可能留下已创建资源或禁用状态，不能把命令失败视为事务回滚。修复后先核对状态再重跑。
-
-若需要保留旧硬隔离状态，先按迁移规则准备两份 degraded 名单，不能让新建 `none` 被误解为后端健康结论。工作流和命名映射不一致时部署会拒绝覆盖；重新命名应走显式迁移。
-
-## 授予控制器权限
-
-由具备角色授权权限的操作者运行：
-
-```bash
-python3 -m apim_routing --config config.local.json grant-controller-roles
-```
-
-此命令给工作流当前系统身份授予两个 Named Value 精确资源范围的 Contributor，不授予整个 APIM、资源组或订阅。已有同等角色应复用。若出现 403，交给有权限的管理员，不自动换身份或扩大范围。
-
-## 显式安装 API 策略
-
-**此动作替换现有 API 级 policy。** 先确认其继承关系与现有认证、配额、审计逻辑兼容；渲染策略不能自动合并任意现有策略。备份文件可能包含现有 policy 的秘密，保存在受限、未提交的目录中：
-
-```bash
-python3 -m apim_routing --config config.local.json install-policy \
+python3 -B -m apim_routing --config config.local.json install-policy \
   --confirm --backup rendered/original.policy-backup.json
 ```
 
-不能通过改文件名绕过“未保存原策略就替换”的变更要求。若同一备份路径已有文件，保留原文件，使用新的受控备份路径。安装完成后先完成真实短请求鉴权和转发检查，不急于启用告警。
+该命令先检查外部资源、备份旧策略，再用 ETag 条件更新。备份路径已存在会停止，不覆盖旧备份。注意：它根据配置和模板重新生成策略，**不读取手工编辑后的 `rendered/policy.xml`**。若审阅中合并了业务策略，应按审阅版本单独发布并另行核对，而不能用该命令覆盖合并结果。
 
-## 控制器 smoke 与告警启用
+### 手动修改 Named Value 验证选路
 
-**smoke 会真实改变名单并发送钉钉消息，不是只读检查。** 它暂时设置/恢复两组名单，针对四条映射执行更新、重复和 Resolved 共 12 次通知，另测试三种拒绝情况，不发送模型流量。只能在没有业务流量、其他写入者和真实告警的隔离维护窗口执行。
+两组分别验证，每次写入前读取最新值和 ETag，使用 `If-Match: <实际 ETag>` PATCH；遇到冲突停止重读，不使用通配 ETag。`A`、`B` 指本组配置中的实际 token：
 
-如果工作流原本禁用，先在 Azure 中明确启用该工作流；仍保持四条告警禁用。对于受支持的新部署路径，核对返回状态和 Azure 中的工作流状态。
-
-```bash
-python3 -m apim_routing --config config.local.json smoke \
-  --confirm-mutations --receipt smoke-receipt.json
-```
-
-完成后核对原名单已恢复。中断或错误需要人工查看恢复状态；不要直接重启另一轮掩盖失败。成功 receipt 有效期 24 小时，并关联当前配置，用作显式启用的前置条件；receipt 不是抗恶意篡改的安全凭证，也不是模型健康证明。
-
-完成“模型可调用、policy 已安装、角色正确、smoke 成功”的检查后启用：
-
-```bash
-python3 -m apim_routing --config config.local.json enable-alerts \
-  --confirm --smoke-receipt smoke-receipt.json
-```
-
-随后按运行文档进行有预算的真实时延告警演练。暂停四条告警：
-
-```bash
-python3 -m apim_routing --config config.local.json disable-alerts
-```
-
-禁用告警不会自动取消已在途的 Logic App 运行，也不会恢复名单或撤销 APIM 策略。
-
-## 源码和本地检查
-
-| 路径 | 内容 |
+| 名单值 | 预期 |
 |---|---|
-| `apim_routing/policy.xml.template` | 参数化 APIM policy 源码 |
-| `apim_routing/workflow.py` | Logic Apps Workflow Definition Language 生成器 |
-| `apim_routing/config.py` | 外部资源与路由配置校验 |
-| `apim_routing/render.py` | 生成 policy、工作流、规则和清单 |
-| `apim_routing/deploy.py` | 分阶段部署、授权、smoke 与启用 |
-| `examples/config.example.json` | 无具体环境依赖的配置结构示例 |
+| `none` | 两个成员均可被选中；少量请求不保证严格 50/50 |
+| `A` | 首次优先 B |
+| `B` | 首次优先 A |
+| `A,B` | 两个成员仍可访问，不因全降级主动拒绝 |
+| 正常成员受控返回 429/503 | 最多向另一个成员重试一次，包括降级成员 |
+| 401/403/404、慢但成功的 200 | 不扩大重试范围 |
 
-无需安装额外测试包：
+通过 APIM 使用短小非敏感输入调用 chat 和 embedding，查看响应状态、请求 ID、`X-Backend-Region` 与必要的受控诊断；确保全部候选都有成功样本。更改 chat 名单不得影响 embedding，反之亦然。配置传播有延迟，不能紧接写入就断言失败。
+
+错误注入和非法名单场景只在隔离、获授权的测试范围执行，不破坏真实后端或生产名单。结束时基于当前值/ETag 恢复测试前状态；如发生真实事故或其他写入，不得盲目恢复快照。失败则回滚匹配的策略与名单，不进入下一步。
+
+**本步完成条件：**不依赖告警或 Logic App，已证明 APIM 身份鉴权、组间隔离、降级优先级和一次跨后端重试符合预期。
+
+## 4. 创建 Logic App，并授权其操作 Named Value
+
+先单独创建 Consumption Logic App，流程代码使用第二步的 `workflow.json`。工作流启用 **SystemAssigned** 身份；它与 APIM 的 UAMI 是两种不同身份。
+
+用 `az rest` 时需将 definition 包装为完整请求体：
+
+| 字段 | 内容 |
+|---|---|
+| `location` | 配置中的工作流区域 |
+| `identity.type` | `SystemAssigned` |
+| `properties.state` | 初次创建可设 `Enabled`；此时尚无启用的告警 |
+| `properties.definition` | `workflow.json` 完整内容 |
+| `properties.parameters.dingtalkWebhook.value` | 通过受控渠道输入的长期钉钉机器人 Webhook |
+
+以下 `$SUB`、`$RG`、`$WORKFLOW` 分别取配置的 `subscription_id`、`controller_resource_group`、`workflow_name`。`workflow.request.secret.json` 需按上表安全准备，权限为 `600`，不提交、不作为附件发送，使用后删除：
 
 ```bash
-python3 -m unittest discover -s tests -v
+az rest --method put --subscription "$SUB" \
+  --url "https://management.azure.com/subscriptions/$SUB/resourceGroups/$RG/providers/Microsoft.Logic/workflows/$WORKFLOW?api-version=2019-05-01" \
+  --headers Content-Type=application/json \
+  --body @workflow.request.secret.json --output none
 ```
 
-这些测试不向 Azure 写入，不证明任何真实订阅已完成部署。
+确认 provisioningState 为 `Succeeded`、定义一致且系统身份 principal ID 已生成。更新既有工作流时先暂停来源告警、禁用并排空运行，保留原身份、秘密参数及资源设置；**不要用新建请求体直接覆盖或删除重建已有工作流**。
 
-## 变更完成判据
+随后单独授权：
 
-启用之前，必须在受控环境确认：
+```bash
+python3 -B -m apim_routing --config config.local.json grant-controller-roles
+```
 
-- API 使用指定 UAMI 能调用两组全部成员，而不是仅证明部署人员直连可用。
-- 策略引用的 Named Value 名称、后端 ID、路由 token 与控制器映射一致。
-- 控制器系统身份在两个新 Named Value 上具备作用域正确的角色。
-- Common Alert Schema 的实际事件能被接收和校验，名单更新与通知分别完成。
-- 人工模拟并不被当成真实时延事件；真实闭环验收方法见 [运行文档](operations.md)。
+该命令只给配置指定工作流的系统身份授予两份 Named Value **各自精确资源范围**的 Contributor。操作者需有 `Microsoft.Authorization/roleAssignments/write`；Contributor 本身不含此权限。若用 Portal/CLI 手工授权，也必须采用相同精确 scope，不能扩大到 APIM、资源组或订阅。等待 RBAC 传播，出现 403 时核对主体及作用域，不用扩大权限解决。
 
-## 已有环境更新和恢复
+如要复用其他工作流，应先确认定义、规则映射、身份和两份名单一致，并向实际接收告警的工作流身份授权；不能仅凭工作流名称相似就复用。
 
-更新时不能重置已有 degraded 值。不要删除重建工作流来更新定义，否则系统身份 principal ID 会变化。资源更名或改变规则映射也可能留下旧规则或旧授权，需做显式变更计划。
+**本步完成条件：**工作流定义和安全参数已配置，系统身份稳定，并具备目标 Named Value 的精确范围权限。
 
-保存政策和名单快照时不要导出订阅密钥、Webhook 或 callback 到源码目录。若恢复到旧 policy，请连同匹配的名单语义一起恢复；不要混用旧 enabled 名单与新 degraded 名单。
+## 5. 参考历史时延调整告警配置，连接 Action Group，分别创建告警
 
-停止条件与回滚流程参见 [运行与恢复](operations.md#更新和回滚)。
+### 用历史指标确定正式阈值和评估窗口
+
+在各 Foundry 账户的 Azure Monitor Metrics 中选择 `AzureOpenAITTLTInMS`，按 `ModelDeploymentName` 区分四个候选，使用与告警一致的 `Average` 聚合。选取包含正常峰谷、工作日/非工作日及已知异常的代表性时段（例如最近 7 天），观察正常范围、持续高延迟和低流量缺数；不要把缺失值当作 0。
+
+结合业务延迟目标和历史误报情况确定阈值。窗口越短越敏感，越长越平滑但检测变慢；评估频率影响检查间隔。这里的指标是服务端总响应时延 TTLT，不是客户端端到端耗时或首 token 时延，不能混用。
+
+**当前代码限制必须遵守：**
+
+- `threshold_ms` 是四条告警共用的正数；不支持直接配置四个独立阈值。
+- `window_size` 可选 `PT1M`、`PT5M`、`PT15M`、`PT30M`、`PT1H`、`PT6H`、`PT12H`、`P1D`；`evaluation_frequency` 可选 `PT1M`、`PT5M`、`PT10M`、`PT15M`、`PT30M`、`PT1H`。评估间隔不能大于窗口。两项省略时均默认 `PT1M`，保留旧配置行为；示例使用 `PT5M` / `PT1M`，表示每分钟评估最近五分钟的平均时延。
+- 配置文件继续使用 `window_size` / `evaluation_frequency`，生成的告警使用 Azure 的 `windowSize` / `evaluationFrequency`。这些选项参考 [Azure Monitor 静态指标告警模板](https://learn.microsoft.com/en-us/azure/azure-monitor/alerts/resource-manager-alerts-metric)，实际资源/指标限制仍以 Azure 返回为准。修改后重新生成并单独更新告警；只改 Portal 会造成配置漂移。工作流不校验这两个字段，仅调整窗口/频率无需更新其定义。
+- 工作流要求事件中的 threshold 与生成值相等。正式阈值变化时先暂停告警、排空运行，同步更新配置、重新生成并单独更新工作流，再逐条更新禁用告警，不能只调告警规则。
+
+### 先单独创建或确认 Action Group
+
+四条告警必须绑定一个明确的 Action Group。新建时单独创建，不与告警混在一条发布脚本里：
+
+```text
+PUT {action_group_resource_id}?api-version=2023-01-01
+location: global
+properties.groupShortName: 配置中的短名称
+properties.enabled: true
+properties.logicAppReceivers:
+  - name: degraded-routing-controller
+    resourceId: 第四步的 Logic App 完整 ID
+    callbackUrl: 该工作流 receive 触发器的回调 URL
+    useCommonAlertSchema: true
+```
+
+回调通过工作流 `triggers/receive/listCallbackUrl?api-version=2019-05-01` 的 POST 获取，它含访问凭据，不能输出或提交到非秘密文件。用受控请求体执行单独的 `az rest --method put`；Action Group 启用不等于告警已启用。
+
+**复用已有 Action Group（包括跨资源组）时，不修改其其他接收器。** 核对其启用状态、实际 Logic App 目标、回调和 Common Alert Schema，并评估所有接收器的通知影响。配置生成器默认把 Action Group 放在控制资源组；当前没有独立的外部 Action Group ID 配置项。若选用外部组，需在未提交的告警发布副本中把四条 `actions[].actionGroupId` 改为确认的完整 ID，审阅后发布并保留该差异记录。
+
+这类手工定制路径不能盲目重跑原 `deploy`、`smoke`、`enable-alerts`：它们按配置推导的工作流、Action Group、原始策略和告警定义进行写入或检查，可能覆盖绑定或因漂移失败。应先统一实现/配置，或使用审阅后的单资源命令并逐项完成等价验收；不要伪造 smoke receipt。
+
+### 每次只创建一条告警
+
+使用审核后的 `alerts.json`，确保每条 `enabled` 为 `false`。不是把整个文件作为 ARM 模板提交，而是按资源 ID 提取：
+
+```bash
+# SUB/RG 取控制资源订阅和资源组；NAME 每次选择一个已审核的 alert_name。
+ALERTS=./rendered/alerts.json
+RID="/subscriptions/$SUB/resourceGroups/$RG/providers/Microsoft.Insights/metricAlerts/$NAME"
+BODY=$(jq -ec --arg id "$RID" '.[$id] // error("Alert not found")' "$ALERTS") &&
+az rest --method put --subscription "$SUB" \
+  --url "https://management.azure.com$RID?api-version=2018-03-01" \
+  --headers Content-Type=application/json --body "$BODY" \
+  --query '{name:name,enabled:properties.enabled,actions:properties.actions}' -o json
+```
+
+四条分别执行、分别确认。`PUT` 会覆盖已有同名告警，先读取现状；遇到权限、维度或资源不匹配错误停止，不继续批量提交。完成后读取四条规则，核对 Foundry scope、模型部署维度、指标、阈值、窗口、频率、Action Group 和禁用状态。
+
+**本步完成条件：**正式配置有历史数据依据，Action Group 指向预期工作流，四条规则正确且尚未启用。
+
+## 6. 临时调低阈值，触发真实告警完成闭环验证
+
+**仅在获授权的维护窗口执行。** 通知业务及钉钉接收方，设置请求数、费用、最长等待时间和中止条件。记录正式配置、阈值、窗口、各告警启用状态、工作流版本、名单及 ETag。这一步会产生真实推理费用、告警、名单变更和通知。
+
+### 同步临时阈值，不只修改告警
+
+1. 保持四条告警禁用，暂停其他名单写入者；禁用工作流并等待在途运行结束。
+2. 将配置复制为未提交的 `config.drill.local.json`，只把 `threshold_ms` 调为根据历史指标选出的较低正数（不能设为 0）。保持正式 `config.local.json` 不变。
+3. 离线生成演练定义：
+
+```bash
+python3 -B -m apim_routing --config config.drill.local.json validate
+python3 -B -m apim_routing --config config.drill.local.json render --output-dir rendered/drill
+```
+
+4. 单独更新原工作流 definition 中的临时阈值，保留系统身份、Webhook 安全参数和其他设置；恢复工作流运行，再逐条更新四条告警的临时定义，仍保持禁用。外部 Action Group 绑定需在演练定义中同样保留，不能被重新生成的默认 ID 覆盖。
+5. 完成模型调用、权限和通知链路的受控预检。标准配置路径可先执行下面的 synthetic smoke；手工定制路径按第五步说明完成等价预检。
+
+```bash
+python3 -B -m apim_routing --config config.drill.local.json smoke \
+  --confirm-mutations --receipt rendered/drill/smoke-receipt.json
+```
+
+smoke 会临时修改并恢复名单、发送 12 次通知并检查三种拒绝情况，**不调用模型，不是真实时延闭环证据**。receipt 有效期为 24 小时，关联配置和工作流状态；修改配置/工作流后旧 receipt 不能复用。只在隔离窗口、无其他写入时运行。
+
+### 触发并观察真实链路
+
+每次仅启用一条待验收告警（审阅后在 Portal 或单资源 ARM PATCH 中设 `properties.enabled=true`），其他规则保持禁用。确认该规则不是已经持续 Fired；清除名单本身不会保证再次发送 Fired。
+
+经 APIM 向对应模型发少量、预算内的正常请求，确保待测候选实际收到流量；查看真实 TTLT 指标是否在临时阈值之上。依次对四条映射执行，不能用手工构造事件或客户端耗时替代真实指标。
+
+| 环节 | 必须观察的证据 |
+|---|---|
+| 原生指标 | 正确 Foundry、部署维度、时间桶的 TTLT Average 超过临时阈值 |
+| Azure Monitor | 对应规则产生真实 Fired 及告警 ID |
+| Action Group / Logic App | 预期工作流收到该事件，校验通过，运行成功 |
+| Named Value | 对应组新增正确 token，ETag 条件写入成功，另一组不受影响 |
+| 钉钉 | 通知发送成功且实际收到，不能只看 HTTP 触发器接受成功 |
+| 后续 APIM 请求 | 配置传播后优先选择未降级成员；不自动屏蔽所有降级成员 |
+
+若没有可用指标或始终未越阈值，记录“未触发”，停止并分析，不无限加压。持续 401/403、严重限流、影响业务、ETag 冲突、通知失败或预算耗尽时立即停止；通知失败也可能已经写入名单，不假定自动回滚。
+
+### 恢复正式设置
+
+演练后先逐条禁用告警、停止演练请求，禁用并排空工作流；恢复正式 workflow definition 和四条正式告警阈值/窗口/绑定，保留身份和秘密。用最新 ETag 仅移除演练产生的名单项，保留真实故障状态；核对各候选健康及策略选路后再决定恢复名单。
+
+恢复工作流，完成正式配置预检，再按审批逐条恢复或启用正式告警。若使用标准路径的 `enable-alerts` 命令，需要在正式配置下重新完成 smoke，不能使用临时配置 receipt；该命令会启用四条规则，不适用于要求逐条审批的发布方式。
+
+**Resolved 只通知，不会自动清除 degraded 名单。** 禁用告警也不会取消已在途的工作流或撤回 APIM 策略。恢复失败时保持相关告警禁用，记录残留资源/状态并交接，不宣布闭环完成。
+
+**最终完成条件：**四条映射均有真实指标 → Fired → 工作流 → 名单 → 钉钉 → 后续选路的证据，正式阈值与窗口已恢复，演练状态已按审批清理，运行负责人明确。日常操作与回滚见 [运行与恢复](operations.md)。
