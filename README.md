@@ -77,4 +77,4 @@ python3 -m apim_routing --config config.local.json render --output-dir rendered
 
 仓库示例只描述配置结构，不是可以直接访问的环境。真实配置、生成目录及凭据不得提交。DingTalk Webhook 通过秘密输入传给 Logic App `SecureString` 参数，通知动作隐藏输入输出。Logic App 回调 URL 同样是凭据。
 
-本仓库没有自动调用生产 Azure 的 CI，也不附带模型压测或历史实验日志。离线测试只能证明配置与生成逻辑；部署后仍须在获授权的隔离环境完成真实闭环验收。
+本仓库没有自动调用生产 Azure 的 CI，也不附带模型压测工具。离线测试只能证明配置与生成逻辑；部署后仍须在获授权的隔离环境完成真实闭环验收。
