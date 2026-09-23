@@ -9,22 +9,22 @@
         <choose>
             <when condition='@((string)context.Variables["is-embedding"] == "true")'>
                 <set-variable name="backends" value="__EMBEDDING_BACKENDS__" />
-                <set-variable name="backend-names" value="__EMBEDDING_TOKENS__" />
+                <set-variable name="backend_names" value="__EMBEDDING_BACKEND_NAMES__" />
                 <set-variable name="degraded-routes" value="__EMBEDDING_NAMED__" />
             </when>
             <otherwise>
                 <set-variable name="backends" value="__CHAT_BACKENDS__" />
-                <set-variable name="backend-names" value="__CHAT_TOKENS__" />
+                <set-variable name="backend_names" value="__CHAT_BACKEND_NAMES__" />
                 <set-variable name="degraded-routes" value="__CHAT_NAMED__" />
             </otherwise>
         </choose>
         <set-variable name="route-config-valid" value='@{
             var raw = (string)context.Variables["degraded-routes"];
             if (raw == "none") { return true; }
-            var allowed = ((string)context.Variables["backend-names"]).Split(new [] { (char)44 });
-            var tokens = raw.Split(new [] { (char)44 });
-            return tokens.All(x => allowed.Contains(x))
-                &amp;&amp; tokens.Distinct().Count() == tokens.Length;
+            var backend_names = ((string)context.Variables["backend_names"]).Split(new [] { (char)44 });
+            var degraded_backend_names = raw.Split(new [] { (char)44 });
+            return degraded_backend_names.All(x => backend_names.Contains(x))
+                &amp;&amp; degraded_backend_names.Distinct().Count() == degraded_backend_names.Length;
         }' />
         <choose>
             <when condition='@(!(bool)context.Variables["route-config-valid"])'>
@@ -40,7 +40,7 @@
         <set-variable name="backend-count" value='@(((string)context.Variables["backends"]).Split(new [] { (char)44 }).Length)' />
         <!-- Prefer non-degraded members initially, but retain every member for retry. -->
         <set-variable name="backend-index" value='@{
-            var names = ((string)context.Variables["backend-names"]).Split(new [] { (char)44 });
+            var names = ((string)context.Variables["backend_names"]).Split(new [] { (char)44 });
             var degraded = ((string)context.Variables["degraded-routes"]).Split(new [] { (char)44 });
             var preferred = Enumerable.Range(0, names.Length)
                 .Where(i => !degraded.Contains(names[i])).ToArray();
@@ -60,7 +60,7 @@
         <retry condition='@((int)context.Variables["backend-count"] &gt; 1 &amp;&amp; context.Response != null &amp;&amp; (context.Response.StatusCode == 429 || context.Response.StatusCode &gt;= 500))' count="1" interval="1" delta="1" first-fast-retry="true">
             <set-variable name="backend-index" value='@(((int)context.Variables["backend-index"] + 1) % (int)context.Variables["backend-count"])' />
             <set-variable name="backend-id" value='@(((string)context.Variables["backends"]).Split(new [] { (char)44 })[(int)context.Variables["backend-index"]])' />
-            <set-variable name="backend-name" value='@(((string)context.Variables["backend-names"]).Split(new [] { (char)44 })[(int)context.Variables["backend-index"]])' />
+            <set-variable name="backend_name" value='@(((string)context.Variables["backend_names"]).Split(new [] { (char)44 })[(int)context.Variables["backend-index"]])' />
             <set-backend-service backend-id='@((string)context.Variables["backend-id"])' />
             <forward-request buffer-request-body="true" />
         </retry>
@@ -68,7 +68,7 @@
     <outbound>
         <base />
         <set-header name="X-Backend-Region" exists-action="override">
-            <value>@(context.Variables.GetValueOrDefault&lt;string&gt;("backend-name", "unknown"))</value>
+            <value>@(context.Variables.GetValueOrDefault&lt;string&gt;("backend_name", "unknown"))</value>
         </set-header>
     </outbound>
     <on-error>

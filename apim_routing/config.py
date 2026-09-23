@@ -13,7 +13,7 @@ class ConfigError(ValueError):
 
 
 NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
-TOKEN = re.compile(r"^[a-z][a-z0-9-]{0,39}$")
+BACKEND_NAME = re.compile(r"^[a-z][a-z0-9-]{0,39}$")
 RESOURCE = re.compile(
     r"^/subscriptions/([0-9a-fA-F-]{36})/resourceGroups/([^/]+)/providers/"
     r"([^/]+)/([^/]+)/([^/]+)$", re.I
@@ -95,20 +95,27 @@ def validate(data):
         named.append(name(spec["named_value_name"], "named_value_name"))
         require(isinstance(spec["routes"], list) and len(spec["routes"]) == 2,
                 "Each group requires exactly two routes")
-        tokens, backends, deployments = [], [], []
+        backend_names, backends, deployments = [], [], []
         for route in spec["routes"]:
-            keys(route, ("token", "backend_id", "foundry_resource_id", "deployment_name", "alert_name"))
-            token = route["token"]
-            require(isinstance(token, str) and TOKEN.fullmatch(token) and token != "none",
-                    "Route token must be lowercase alphanumeric/hyphen and not none")
-            tokens.append(token)
+            keys(route, ("backend_id", "foundry_resource_id", "deployment_name", "alert_name"),
+                 ("backend_name", "token"))
+            require(("backend_name" in route) != ("token" in route),
+                    "Specify exactly one of backend_name or legacy token")
+            # Normalize the legacy input only; all generated artifacts use backend_name.
+            if "token" in route:
+                route["backend_name"] = route.pop("token")
+            backend_name = route["backend_name"]
+            require(isinstance(backend_name, str) and BACKEND_NAME.fullmatch(backend_name)
+                    and backend_name != "none",
+                    "Backend name must be lowercase alphanumeric/hyphen and not none")
+            backend_names.append(backend_name)
             backends.append(name(route["backend_id"], "backend_id"))
             alerts.append(name(route["alert_name"], "alert_name"))
             deployments.append(name(route["deployment_name"], "deployment_name"))
             resource(route["foundry_resource_id"], "Microsoft.CognitiveServices", "accounts", "Foundry")
             require(("embedding" in route["deployment_name"]) == (group == "embedding"),
                     "Deployment names must match case-sensitive Contains('embedding') classification")
-        require(len(set(tokens)) == 2, "Route tokens must be unique within each group")
+        require(len(set(backend_names)) == 2, "Backend names must be unique within each group")
         require(len(set(backends)) == 2, "Backend IDs must be distinct within each group")
         require(len(set(deployments)) == 1,
                 "Both routes in a group must use the same deployment name (request path is unchanged)")
@@ -153,10 +160,10 @@ def routes(config):
 def rule_map(config):
     return {
         route["alert_name"]: {
-            "route": group + "-" + route["token"], "group": group,
-            "region": route["token"], "account": route["foundry_resource_id"].lower(),
+            "route": group + "-" + route["backend_name"], "group": group,
+            "backend_name": route["backend_name"], "account": route["foundry_resource_id"].lower(),
             "deployment": route["deployment_name"], "namedValue": named_id(config, group),
-            "allowed": [item["token"] for item in config["groups"][group]["routes"]],
+            "backend_names": [item["backend_name"] for item in config["groups"][group]["routes"]],
         } for group, route in routes(config)
     }
 
@@ -165,10 +172,12 @@ def digest(config):
     return hashlib.sha256(json.dumps(config, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def parse_routes(value, allowed):
+def parse_routes(value, backend_names):
     if value == "none":
         return []
-    tokens = value.split(",") if isinstance(value, str) else []
-    require(bool(tokens) and len(set(tokens)) == len(tokens) and set(tokens) <= set(allowed),
+    degraded_backend_names = value.split(",") if isinstance(value, str) else []
+    require(bool(degraded_backend_names)
+            and len(set(degraded_backend_names)) == len(degraded_backend_names)
+            and set(degraded_backend_names) <= set(backend_names),
             "Invalid existing degraded route list; refusing to overwrite")
-    return tokens
+    return degraded_backend_names

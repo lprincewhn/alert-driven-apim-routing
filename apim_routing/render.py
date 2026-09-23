@@ -17,7 +17,7 @@ def policy(config):
     for group, spec in config["groups"].items():
         prefix = "__" + group.upper()
         replacements[prefix + "_BACKENDS__"] = ",".join(r["backend_id"] for r in spec["routes"])
-        replacements[prefix + "_TOKENS__"] = ",".join(r["token"] for r in spec["routes"])
+        replacements[prefix + "_BACKEND_NAMES__"] = ",".join(r["backend_name"] for r in spec["routes"])
         replacements[prefix + "_NAMED__"] = "{{" + spec["named_value_name"] + "}}"
     for key, value in replacements.items():
         text = text.replace(key, escape(value, {'"': "&quot;"}))

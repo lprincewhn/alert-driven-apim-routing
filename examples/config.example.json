@@ -16,14 +16,14 @@
       "named_value_name": "chat-degraded-routes",
       "routes": [
         {
-          "token": "region-a",
+          "backend_name": "region-a",
           "backend_id": "replace-chat-backend-a",
           "foundry_resource_id": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/replace-foundry-rg/providers/Microsoft.CognitiveServices/accounts/replace-foundry-a",
           "deployment_name": "replace-chat-deployment",
           "alert_name": "replace-chat-a-latency"
         },
         {
-          "token": "region-b",
+          "backend_name": "region-b",
           "backend_id": "replace-chat-backend-b",
           "foundry_resource_id": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/replace-foundry-rg/providers/Microsoft.CognitiveServices/accounts/replace-foundry-b",
           "deployment_name": "replace-chat-deployment",
@@ -35,14 +35,14 @@
       "named_value_name": "embedding-degraded-routes",
       "routes": [
         {
-          "token": "region-c",
+          "backend_name": "region-c",
           "backend_id": "replace-embedding-backend-c",
           "foundry_resource_id": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/replace-foundry-rg/providers/Microsoft.CognitiveServices/accounts/replace-foundry-c",
           "deployment_name": "replace-embedding-deployment",
           "alert_name": "replace-embedding-c-latency"
         },
         {
-          "token": "region-d",
+          "backend_name": "region-d",
           "backend_id": "replace-embedding-backend-d",
           "foundry_resource_id": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/replace-foundry-rg/providers/Microsoft.CognitiveServices/accounts/replace-foundry-d",
           "deployment_name": "replace-embedding-deployment",

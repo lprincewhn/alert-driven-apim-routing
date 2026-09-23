@@ -146,9 +146,9 @@ def definition(config):
     config_valid = (
         "@and(equals(body('Read_routes')?['properties']?['secret'], false), "
         "equals(toLower(body('Read_routes')?['id']), toLower(outputs('Match_rule')?['namedValue'])), "
-        "equals(length(outputs('Tokens')), length(union(outputs('Tokens'), outputs('Tokens')))), "
-        "equals(length(outputs('Tokens')), length(intersection(outputs('Tokens'), "
-        "outputs('Match_rule')?['allowed']))))"
+        "equals(length(outputs('degraded_backend_names')), length(union(outputs('degraded_backend_names'), outputs('degraded_backend_names')))), "
+        "equals(length(outputs('degraded_backend_names')), length(intersection(outputs('degraded_backend_names'), "
+        "outputs('Match_rule')?['backend_names']))))"
     )
     # Do not use '*' or retry a stale ETag: conflicts and authorization errors
     # must remain visible and must not overwrite a concurrent operator change.
@@ -159,7 +159,7 @@ def definition(config):
     update = sequence(
         Union_csv={
             "type": "Compose",
-            "inputs": "@join(union(outputs('Tokens'), createArray(variables('Region'))), ',')",
+            "inputs": "@join(union(outputs('degraded_backend_names'), createArray(variables('backend_name'))), ',')",
         },
         Write_routes=write,
         Save_after_etag=set_value(
@@ -179,7 +179,7 @@ def definition(config):
         ),
     )
     change = condition(
-        "@contains(outputs('Tokens'), variables('Region'))",
+        "@contains(outputs('degraded_backend_names'), variables('backend_name'))",
         sequence(Already_degraded=set_value("Outcome", "AlreadyDegraded")),
         sequence(
             Read_etag={
@@ -211,7 +211,7 @@ def definition(config):
                 },
             },
         },
-        Tokens={
+        degraded_backend_names={
             "type": "Compose",
             "inputs": "@if(equals(body('Read_routes')?['properties']?['value'], 'none'), "
                       "json('[]'), split(body('Read_routes')?['properties']?['value'], ','))",
@@ -233,7 +233,7 @@ def definition(config):
     accepted = sequence(
         Save_route=set_value("Route", "@outputs('Match_rule')?['route']"),
         Save_group=set_value("Group", "@outputs('Match_rule')?['group']"),
-        Save_region=set_value("Region", "@outputs('Match_rule')?['region']"),
+        Save_backend_name=set_value("backend_name", "@outputs('Match_rule')?['backend_name']"),
         Save_metric=set_value("Metric", f"@string(float({criterion}?['metricValue']))"),
         Accept_event=set_value("Accepted", True),
         Accept_status=set_value("StatusCode", 200),
@@ -292,7 +292,7 @@ def definition(config):
                 "text": {
                     "content": "@concat('Azure APIM 路由告警', decodeUriComponent('%0A'), "
                                "'业务类型：', if(equals(variables('Group'), 'chat'), '对话', '向量嵌入'), "
-                               "'；区域：', variables('Region'), decodeUriComponent('%0A'), "
+                               "'；后端名称：', variables('backend_name'), decodeUriComponent('%0A'), "
                                "'处理结果：', "
                                "if(equals(variables('Outcome'), 'Updated'), '已加入降级名单', "
                                "if(equals(variables('Outcome'), 'AlreadyDegraded'), '已在降级名单中，无需重复更新', "
@@ -333,7 +333,7 @@ def definition(config):
     finish["runAfter"] = {"Notify": FINISHED}
     variables = {
         "Outcome": ("string", "Rejected"), "Route": ("string", ""),
-        "Group": ("string", ""), "Region": ("string", ""), "Metric": ("string", ""),
+        "Group": ("string", ""), "backend_name": ("string", ""), "Metric": ("string", ""),
         "Before": ("string", ""), "After": ("string", ""),
         "BeforeETag": ("string", ""), "AfterETag": ("string", ""),
         "Accepted": ("boolean", False), "ControllerFailed": ("boolean", False),
