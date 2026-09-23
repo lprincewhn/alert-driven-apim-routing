@@ -25,7 +25,7 @@ test ! -e config.local.json && cp examples/config.example.json config.local.json
 | `workflow_name` | 要创建的控制器 Logic App 名称 |
 | `action_group_name`、`action_group_short_name` | Action Group 名称和不超过 12 字符的短名称 |
 | `groups.chat`、`groups.embedding` | 各自的 `named_value_name` 及恰好两个 `routes` |
-| 每条 route | `token`、已有 `backend_id`、`foundry_resource_id`、`deployment_name`、唯一 `alert_name` |
+| 每条 route | `backend_name`、已有 `backend_id`、`foundry_resource_id`、`deployment_name`、唯一 `alert_name` |
 | `threshold_ms` | 四条告警共用的 TTLT 阈值，默认 2000 ms；第五步依据历史数据确定正式值 |
 | `window_size`、`evaluation_frequency` | 分别生成告警的 `windowSize`、`evaluationFrequency`；示例为 `PT5M` / `PT1M`，省略时均默认 `PT1M`；可选值见第五步 |
 
@@ -38,7 +38,11 @@ test ! -e config.local.json && cp examples/config.example.json config.local.json
 
 同组两个成员的模型部署名必须相同，因为策略不改写部署名。Embedding 部署名必须包含小写 `embedding`，聊天部署名不能包含它；不满足时需先调整并审阅分类策略。backend 必须指向对应 Foundry 的 HTTPS 根端点，不能附加路径或冲突的 API key/Authorization 凭据。APIM UAMI 必须已有各 Foundry 账户的推理权限。
 
-`token` 是稳定路由标识，必须与 Named Value 中的名单成员一致。已有名单需核对语义：本方案是 **degraded（降级）名单**，不是旧版 enabled（可用）名单。
+`backend_name` 是组内唯一的稳定逻辑后端名称，必须与 Named Value 中的名单成员一致；它不是 APIM backend 资源名称，也不要求等于 Azure 区域。`backend_id` 才指向实际 APIM backend。已有名单需核对语义：本方案是 **degraded（降级）名单**，不是旧版 enabled（可用）名单。
+
+旧配置的 `token` 暂作为兼容别名接受，加载时归一化为 `backend_name`；同一条 route 不允许同时填写两者，即使值相同。新配置只使用 `backend_name`，重命名字段时保持现有名单成员值不变。生成的 workflow 使用 `backend_name`、`backend_names` 和 `degraded_backend_names`，policy 使用 `backend_name` / `backend_names`。部署前映射检查兼容旧 workflow 的 `region` / `allowed`，但仍拒绝实际成员或名单映射变更。固定 APIM 属性 `backend-id` 不变，响应头 `X-Backend-Region` 为客户端兼容保留，其值仍为逻辑后端名称；工作流的 `route` 响应字段及状态码不变。
+
+字段迁移后需重新生成、审阅并分别发布 policy 与 workflow；更新 workflow 时仍须暂停告警、排空运行并保留原身份和安全参数，不能仅修改线上 JSON 字段。旧 smoke receipt 不应复用，应在迁移后的配置和定义下重新验证。
 
 **本步完成条件：**配置中的资源确实存在、模型部署就绪、身份及路径匹配；不只是在 JSON 中填完字符串。
 
@@ -99,7 +103,7 @@ python3 -B -m apim_routing --config config.local.json install-policy \
 
 ### 手动修改 Named Value 验证选路
 
-两组分别验证，每次写入前读取最新值和 ETag，使用 `If-Match: <实际 ETag>` PATCH；遇到冲突停止重读，不使用通配 ETag。`A`、`B` 指本组配置中的实际 token：
+两组分别验证，每次写入前读取最新值和 ETag，使用 `If-Match: <实际 ETag>` PATCH；遇到冲突停止重读，不使用通配 ETag。`A`、`B` 指本组配置中的实际 `backend_name`：
 
 | 名单值 | 预期 |
 |---|---|
@@ -245,7 +249,7 @@ smoke 会临时修改并恢复名单、发送 12 次通知并检查三种拒绝�
 | 原生指标 | 正确 Foundry、部署维度、时间桶的 TTLT Average 超过临时阈值 |
 | Azure Monitor | 对应规则产生真实 Fired 及告警 ID |
 | Action Group / Logic App | 预期工作流收到该事件，校验通过，运行成功 |
-| Named Value | 对应组新增正确 token，ETag 条件写入成功，另一组不受影响 |
+| Named Value | 对应组新增正确 backend_name，ETag 条件写入成功，另一组不受影响 |
 | 钉钉 | 通知发送成功且实际收到，不能只看 HTTP 触发器接受成功 |
 | 后续 APIM 请求 | 配置传播后优先选择未降级成员；不自动屏蔽所有降级成员 |
 

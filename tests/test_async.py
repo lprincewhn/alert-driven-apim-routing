@@ -196,11 +196,11 @@ class SmokeRecoveryTests(unittest.TestCase):
             raise azure.AzureError("Callback failed before writing", 500)
         if failure == "pending":
             raise azure.CallbackPending("https://example.logic.azure.com/operations/example")
-        tokens = parse_routes(self.state[group], [r["token"] for r in self.config["groups"][group]["routes"]])
-        outcome = "AlreadyDegraded" if route["token"] in tokens else "Updated"
+        backend_names = parse_routes(self.state[group], [r["backend_name"] for r in self.config["groups"][group]["routes"]])
+        outcome = "AlreadyDegraded" if route["backend_name"] in backend_names else "Updated"
         if outcome == "Updated":
-            tokens.append(route["token"])
-            self.state[group] = ",".join(tokens)
+            backend_names.append(route["backend_name"])
+            self.state[group] = ",".join(backend_names)
             self.revision += 1
         after_etag = str(self.revision)
         if failure == "concurrent":

@@ -1,6 +1,7 @@
 import copy
 import io
 import json
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -47,6 +48,32 @@ def walk(value):
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_legacy_token_normalizes_to_backend_name(self):
+        canonical = config()
+        legacy = copy.deepcopy(canonical)
+        for _, route in routes(legacy):
+            route["token"] = route.pop("backend_name")
+        normalized = validate(legacy)
+        self.assertEqual(normalized, canonical)
+        self.assertEqual(digest(normalized), digest(canonical))
+        self.assertEqual(policy(normalized), policy(canonical))
+        self.assertEqual(definition(normalized), definition(canonical))
+        self.assertEqual(validate(normalized), canonical)
+
+    def test_missing_or_ambiguous_backend_name_rejected(self):
+        for legacy in ("region-a", "different"):
+            data = config()
+            data["groups"]["chat"]["routes"][0]["token"] = legacy
+            with self.assertRaisesRegex(ConfigError, "exactly one"):
+                validate(data)
+        data = config()
+        del data["groups"]["chat"]["routes"][0]["backend_name"]
+        with self.assertRaisesRegex(ConfigError, "exactly one"):
+            validate(data)
+        data["groups"]["chat"]["routes"][0]["token"] = "none"
+        with self.assertRaisesRegex(ConfigError, "Backend name"):
+            validate(data)
+
     def test_example_and_defaults(self):
         data = config()
         for key in ("threshold_ms", "window_size", "evaluation_frequency"):
@@ -109,17 +136,17 @@ class ConfigurationTests(unittest.TestCase):
         with self.assertRaises(ConfigError):
             validate(data)
 
-    def test_duplicate_tokens_alerts_and_backends(self):
-        for key in ("token", "backend_id", "alert_name"):
+    def test_duplicate_backend_names_alerts_and_backends(self):
+        for key in ("backend_name", "backend_id", "alert_name"):
             data = config()
             data["groups"]["chat"]["routes"][1][key] = data["groups"]["chat"]["routes"][0][key]
             with self.assertRaises(ConfigError):
                 validate(data)
 
     def test_bad_route_values(self):
-        for token in ("none", "A", "x,y", "x'quote", "{{injection}}", ""):
+        for backend_name in ("none", "A", "x,y", "x'quote", "{{injection}}", ""):
             data = config()
-            data["groups"]["chat"]["routes"][0]["token"] = token
+            data["groups"]["chat"]["routes"][0]["backend_name"] = backend_name
             with self.assertRaises(ConfigError):
                 validate(data)
 
@@ -148,7 +175,7 @@ class ConfigurationTests(unittest.TestCase):
         modified["threshold_ms"] = 3000
         self.assertNotEqual(digest(config()), digest(modified))
 
-    def test_strict_token_state_parser(self):
+    def test_strict_backend_name_state_parser(self):
         self.assertEqual(parse_routes("none", ["a", "b"]), [])
         self.assertEqual(parse_routes("a,b", ["a", "b"]), ["a", "b"])
         for raw in ("", " a", "a,", "a,a", "none,a", "c", None):
@@ -157,6 +184,50 @@ class ConfigurationTests(unittest.TestCase):
 
 
 class GeneratorTests(unittest.TestCase):
+    def test_backend_names_consistent_across_generated_artifacts(self):
+        data = config()
+        workflow = definition(data)
+        mapping = workflow["actions"]["Process"]["actions"]["Rule_map"]["inputs"]
+        for group, route in routes(data):
+            rule = mapping[route["alert_name"]]
+            self.assertEqual(rule["backend_name"], route["backend_name"])
+            self.assertEqual(rule["backend_names"],
+                             [r["backend_name"] for r in data["groups"][group]["routes"]])
+            self.assertEqual(rule["route"], group + "-" + route["backend_name"])
+            self.assertNotIn("region", rule)
+            self.assertNotIn("allowed", rule)
+        dumped = json.dumps(workflow)
+        for obsolete in ("outputs('Tokens')", "variables('Region')", "['region']", "['allowed']"):
+            self.assertNotIn(obsolete, dumped)
+        actions = set()
+        def collect_actions(value):
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    if key == "actions" and isinstance(child, dict):
+                        actions.update(child)
+                    collect_actions(child)
+            elif isinstance(value, list):
+                for child in value:
+                    collect_actions(child)
+        collect_actions(workflow)
+        for reference in re.findall(r"(?:outputs|body|actions)\('([^']+)'\)", dumped):
+            self.assertIn(reference, actions)
+        for node in walk(workflow):
+            for predecessor in node.get("runAfter", {}):
+                self.assertIn(predecessor, actions)
+        variables = {v["name"] for v in workflow["actions"]["Initialize"]["inputs"]["variables"]}
+        for reference in re.findall(r"variables\('([^']+)'\)", dumped):
+            self.assertIn(reference, variables)
+        for node in walk(workflow):
+            if node.get("type") == "SetVariable":
+                self.assertIn(node["inputs"]["name"], variables)
+        root = ET.fromstring(policy(data))
+        names = {v.attrib["name"] for v in root.iter("set-variable")}
+        self.assertTrue({"backend_name", "backend_names"} <= names)
+        self.assertFalse({"backend-name", "backend-names"} & names)
+        self.assertIn("backend-id", root.find("./backend/retry/set-backend-service").attrib)
+        self.assertEqual(root.find("./outbound/set-header").attrib["name"], "X-Backend-Region")
+
     def test_policy_preserves_runtime_semantics(self):
         root = ET.fromstring(policy(config()))
         retry = root.find("./backend/retry")
@@ -204,7 +275,7 @@ class GeneratorTests(unittest.TestCase):
         notify = workflow["actions"]["Notify"]
         message = notify["actions"]["DingTalk"]["inputs"]["body"]["text"]["content"]
         for expected in (
-            "Azure APIM 路由告警", "业务类型：", "对话", "向量嵌入", "区域：",
+            "Azure APIM 路由告警", "业务类型：", "对话", "向量嵌入", "后端名称：",
             "已加入降级名单", "已在降级名单中，无需重复更新",
             "告警已恢复，保留降级标记，需人工恢复路由",
             "路由控制器处理失败", "平均总响应时延（TTLT）：", "毫秒",
@@ -279,6 +350,30 @@ class GeneratorTests(unittest.TestCase):
 
 
 class DeploymentTests(unittest.TestCase):
+    def test_legacy_workflow_mapping_migrates_without_reinterpreting_state(self):
+        data = config()
+        existing = {"properties": {"definition": definition(data)}}
+        mapping = existing["properties"]["definition"]["actions"]["Process"]["actions"]["Rule_map"]["inputs"]
+        for rule in mapping.values():
+            rule["region"] = rule.pop("backend_name")
+            rule["allowed"] = rule.pop("backend_names")
+        original = copy.deepcopy(existing)
+        check_existing_mapping(data, existing)
+        self.assertEqual(existing, original)
+        rule = next(iter(mapping.values()))
+        for field, value in (("region", "different"), ("allowed", ["different"]),
+                             ("namedValue", "/different"), ("group", "different")):
+            modified = copy.deepcopy(existing)
+            first = next(iter(modified["properties"]["definition"]["actions"]["Process"]["actions"]["Rule_map"]["inputs"].values()))
+            first[field] = value
+            with self.assertRaisesRegex(azure.AzureError, "mapping differs"):
+                check_existing_mapping(data, modified)
+        for legacy, canonical in (("region", "backend_name"), ("allowed", "backend_names")):
+            rule[canonical] = rule[legacy]
+            with self.assertRaisesRegex(azure.AzureError, "Ambiguous"):
+                check_existing_mapping(data, existing)
+            del rule[canonical]
+
     def test_partial_existing_deployment_stays_disabled_and_preserves_identity(self):
         data = config()
         existing = {
@@ -334,7 +429,7 @@ class DeploymentTests(unittest.TestCase):
         with self.assertRaisesRegex(azure.AzureError, "alert names differ"):
             check_existing_mapping(changed, existing)
         changed = copy.deepcopy(data)
-        changed["groups"]["chat"]["routes"][0]["token"] = "different-token"
+        changed["groups"]["chat"]["routes"][0]["backend_name"] = "different-backend"
         with self.assertRaisesRegex(azure.AzureError, "mapping differs"):
             check_existing_mapping(changed, existing)
         with self.assertRaisesRegex(azure.AzureError, "not a recognized"):
@@ -419,13 +514,13 @@ class DeploymentTests(unittest.TestCase):
         def invoke(callback, event):
             essentials = event["data"]["essentials"]
             group, route = next((g, r) for g, r in routes(data) if r["alert_name"] == essentials["alertRule"])
-            tokens = parse_routes(state[group], [r["token"] for r in data["groups"][group]["routes"]])
+            backend_names = parse_routes(state[group], [r["backend_name"] for r in data["groups"][group]["routes"]])
             outcome = "ResolvedIgnored"
             if essentials["monitorCondition"] == "Fired":
-                outcome = "AlreadyDegraded" if route["token"] in tokens else "Updated"
-                if route["token"] not in tokens:
-                    tokens.append(route["token"])
-                    state[group] = ",".join(tokens)
+                outcome = "AlreadyDegraded" if route["backend_name"] in backend_names else "Updated"
+                if route["backend_name"] not in backend_names:
+                    backend_names.append(route["backend_name"])
+                    state[group] = ",".join(backend_names)
                     revision[0] += 1
             return 200, {"outcome": outcome, "result": outcome,
                          "controllerFailed": False, "notificationFailed": False}

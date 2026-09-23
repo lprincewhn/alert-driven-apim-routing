@@ -51,15 +51,15 @@ def policy_id(config):
     return api_id(config) + "/policies/policy"
 
 
-def allowed(config, group):
-    return [r["token"] for r in config["groups"][group]["routes"]]
+def backend_names(config, group):
+    return [r["backend_name"] for r in config["groups"][group]["routes"]]
 
 
 def check_named(config, group, value):
     properties = value.get("properties", {})
     ensure(properties.get("secret") is False and not properties.get("keyVault"),
            "Named values must be nonsecret and not Key Vault references")
-    parse_routes(properties.get("value"), allowed(config, group))
+    parse_routes(properties.get("value"), backend_names(config, group))
     ensure(properties.get("displayName") == config["groups"][group]["named_value_name"],
            "Named value displayName must equal configured named_value_name for policy expansion")
 
@@ -160,9 +160,15 @@ def check_existing_mapping(config, existing):
            "Existing alert names differ; use an explicit migration to avoid orphaning active rules")
     for name, rule in expected.items():
         old = current[name]
+        ensure(isinstance(old, dict), "Existing rule mapping must be an object")
+        old = copy.deepcopy(old)
+        for legacy, canonical in (("region", "backend_name"), ("allowed", "backend_names")):
+            if legacy in old:
+                ensure(canonical not in old, "Ambiguous existing backend-name mapping")
+                old[canonical] = old.pop(legacy)
         ensure(isinstance(old, dict) and all(old.get(key) == rule[key]
-               for key in ("group", "region", "namedValue", "allowed")),
-               "Existing named-value/token mapping differs; migrate routing state explicitly before deployment")
+               for key in ("group", "backend_name", "namedValue", "backend_names")),
+               "Existing named-value/backend-name mapping differs; migrate routing state explicitly before deployment")
 
 
 def quiesce_workflow(config, azure, existing):
@@ -447,13 +453,13 @@ def smoke(config, azure, receipt):
                 for condition in ("Resolved", "Fired", "Fired"):
                     before = confirmed[0]
                     candidate = before
-                    tokens = parse_routes(before, allowed(config, group))
+                    degraded_backend_names = parse_routes(before, backend_names(config, group))
                     outcome = "ResolvedIgnored"
                     if condition == "Fired":
-                        outcome = "AlreadyDegraded" if route["token"] in tokens else "Updated"
-                        if route["token"] not in tokens:
-                            tokens.append(route["token"])
-                        candidate = ",".join(tokens)
+                        outcome = "AlreadyDegraded" if route["backend_name"] in degraded_backend_names else "Updated"
+                        if route["backend_name"] not in degraded_backend_names:
+                            degraded_backend_names.append(route["backend_name"])
+                        candidate = ",".join(degraded_backend_names)
                     try:
                         status, result = invoke_callback(callback, synthetic_event(config, route, condition))
                     except CallbackPending as pending:
@@ -485,7 +491,7 @@ def smoke(config, azure, receipt):
                     elif possible:
                         ensure(observed == possible, "Concurrent ETag change after controller write")
                     confirmed, possible = observed, None
-                    completed.append({"group": group, "route": route["token"],
+                    completed.append({"group": group, "route": route["backend_name"],
                                       "condition": condition, "outcome": outcome})
         except AzureError as error:
             unsettled = error.uncertain

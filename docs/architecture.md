@@ -6,7 +6,7 @@
 
 APIM 服务、API 操作、backend、用户分配托管身份、Foundry 账户和模型部署由外部管理。本项目引用它们，不创建 APIM、不改模型容量、不修改 backend URL。控制资源与 APIM 可以位于不同资源组；跨订阅引用是否支持，以配置校验和部署权限为准，不能假定当前登录身份拥有目标权限。
 
-每组恰有两个候选成员，分为 `chat` 和 `embedding`。后端的路由标识是配置中的稳定 token，不必是 Azure 区域名。路由标识用于名单和响应头；APIM backend ID 才是实际转发目标。
+每组恰有两个候选成员，分为 `chat` 和 `embedding`。后端的路由标识是配置中的 `backend_name`：组内唯一的稳定逻辑后端名称，不必是 Azure 区域名，也不是可随意修改的展示名称。它用于名单和响应头；`backend_id` 才是实际 APIM 转发目标。
 
 ## 数据面
 
@@ -16,11 +16,11 @@ APIM 服务、API 操作、backend、用户分配托管身份、Foundry 账户�
 
 ```text
 none                  # 无降级成员
-primary               # token 为 primary 的成员降级
+primary               # backend_name 为 primary 的成员降级
 primary,secondary     # 两个成员均降级
 ```
 
-`primary`、`secondary` 仅为示例 token，并不表示固定主备角色。非法 token、重复项、空值、空格、跨组值、尾逗号或混用 `none` 都应拒绝；不能默认为全部正常。
+`primary`、`secondary` 仅为示例后端名称，并不表示固定主备角色。非法后端名称、重复项、空值、空格、跨组值、尾逗号或混用 `none` 都应拒绝；不能默认为全部正常。
 
 首次选择排除降级成员；若没有正常成员，则恢复为全组候选。两者处于同一优先级时，按请求 ID 哈希近似均分。重试候选始终保留全组，所以正常后端返回 429/5xx 时可以回退到降级后端。
 
@@ -32,11 +32,11 @@ primary,secondary     # 两个成员均降级
 
 ```text
 有效 Fired
-  → 静态映射匹配：规则 → 资源/模型 → 组/token → Named Value
+  → 静态映射匹配：规则 → 资源/模型 → 组/backend_name → Named Value
   → GET 当前名单和 ETag
   → 校验名单
-  → 已包含 token：AlreadyDegraded
-  → 未包含 token：If-Match PATCH 并集 → Updated
+  → 已包含 backend_name：AlreadyDegraded
+  → 未包含 backend_name：If-Match PATCH 并集 → Updated
   → 发送通知
 
 有效 Resolved → ResolvedIgnored → 发送通知；不改变名单
