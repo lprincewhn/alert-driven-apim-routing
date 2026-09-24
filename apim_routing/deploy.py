@@ -12,13 +12,12 @@ import xml.etree.ElementTree as ET
 
 from .azure import AzureError, CallbackPending, etag, invoke_callback, resume_callback
 from .config import (
-    action_group_id, alert_id, digest, named_id, parse_routes, root, routes, rule_map, workflow_id,
+    action_group_id, digest, log_query, named_id, parse_routes, root, routes, rule_map, workflow_id,
 )
-from .render import NAMESPACE, METRIC, alert, policy
+from .render import NAMESPACE, METRIC, alert_resources, policy
 from .workflow import definition
 
 LOGIC_VERSION = "2019-05-01"
-ALERT_VERSION = "2018-03-01"
 GROUP_VERSION = "2023-01-01"
 ROLE_VERSION = "2022-04-01"
 FOUNDRY_VERSION = "2024-10-01"
@@ -67,6 +66,11 @@ def check_named(config, group, value):
 def preflight(config, azure):
     """Read-only validation. No model inference or authorization changes."""
     azure.call("GET", root(config), version="2021-04-01")
+    if "apim_log_alerts" in config:
+        logs = config["apim_log_alerts"]
+        workspace, _ = azure.call("GET", logs["workspace_resource_id"], version="2023-09-01")
+        ensure(workspace.get("location", "").lower() == logs["location"],
+               "Log alert location must match the existing Log Analytics workspace")
     apim, _ = azure.call("GET", config["apim_resource_id"])
     ensure(apim.get("properties", {}).get("provisioningState") == "Succeeded",
            "Existing APIM must be fully provisioned")
@@ -156,11 +160,18 @@ def check_existing_mapping(config, existing):
     except (KeyError, TypeError):
         raise AzureError("Existing workflow is not a recognized routing controller; choose a new workflow name") from None
     expected = rule_map(config)
-    ensure(isinstance(current, dict) and set(current) == set(expected),
+    new_log_names = {route["log_alert_name"] for _, route in routes(config)
+                     if "log_alert_name" in route}
+    ensure(isinstance(current, dict) and set(current) <= set(expected)
+           and set(expected) - set(current) <= new_log_names,
            "Existing alert names differ; use an explicit migration to avoid orphaning active rules")
     for name, rule in expected.items():
+        if name not in current:
+            continue
         old = current[name]
         ensure(isinstance(old, dict), "Existing rule mapping must be an object")
+        ensure(old.get("source", "metric") == rule.get("source", "metric"),
+               "Existing alert source differs; migrate resource types explicitly before deployment")
         old = copy.deepcopy(old)
         for legacy, canonical in (("region", "backend_name"), ("allowed", "backend_names")):
             if legacy in old:
@@ -243,8 +254,8 @@ def deploy(config, azure, webhook):
             }],
         },
     }, version=GROUP_VERSION)
-    for _, route in routes(config):
-        azure.call("PUT", alert_id(config, route), alert(config, route), version=ALERT_VERSION)
+    for resource, body, version in alert_resources(config):
+        azure.call("PUT", resource, body, version=version)
     if existing and existing.get("properties", {}).get("state") == "Enabled":
         azure.call("POST", workflow_id(config) + "/enable", {}, version=LOGIC_VERSION)
         resumed, _ = azure.call("GET", workflow_id(config), version=LOGIC_VERSION)
@@ -327,17 +338,17 @@ def install_policy(config, azure, backup):
 def disable_alerts(config, azure, missing_ok=False):
     disabled = 0
     failures = []
-    for _, route in routes(config):
+    for resource, _, version in alert_resources(config):
         try:
-            existing, _ = azure.optional(alert_id(config, route), ALERT_VERSION)
+            existing, _ = azure.optional(resource, version)
             if existing is None:
-                ensure(missing_ok, "Expected metric alert is missing; deploy before changing state")
+                ensure(missing_ok, "Expected alert is missing; deploy before changing state")
                 continue
-            azure.call("PATCH", alert_id(config, route), {"properties": {"enabled": False}}, version=ALERT_VERSION)
+            azure.call("PATCH", resource, {"properties": {"enabled": False}}, version=version)
             disabled += 1
         except AzureError as error:
             failures.append(error.status)
-    ensure(not failures, "Could not disable every alert; inspect Azure permissions and all four rules")
+    ensure(not failures, "Could not disable every alert; inspect Azure permissions and all configured rules")
     return {"disabled_alerts": disabled}
 
 
@@ -364,12 +375,16 @@ def check_controller(config, azure):
 
 
 def check_alerts(config, azure, disabled=False):
-    for _, route in routes(config):
-        current, _ = azure.call("GET", alert_id(config, route), version=ALERT_VERSION)
+    for resource, body, version in alert_resources(config):
+        current, _ = azure.call("GET", resource, version=version)
         properties = current.get("properties", {})
-        expected = alert(config, route)["properties"]
+        expected = body["properties"]
         for key in ("scopes", "evaluationFrequency", "windowSize", "autoMitigate", "criteria", "actions"):
-            ensure(properties.get(key) == expected[key], "Metric alert configuration drift; deploy again")
+            ensure(properties.get(key) == expected[key], "Alert configuration drift; deploy again")
+        if body.get("kind") == "LogAlert":
+            ensure(current.get("kind") == "LogAlert" and current.get("location") == body["location"]
+                   and properties.get("skipQueryValidation") is False,
+                   "Log alert configuration drift; deploy again")
         if disabled:
             ensure(properties.get("enabled") is False, "All alerts must be disabled before synthetic smoke")
 
@@ -378,13 +393,13 @@ def stamp():
     return datetime.now(timezone.utc).isoformat()
 
 
-def rejection_checks(config, callback):
+def rejection_checks(config, callback, source="metric"):
     _, route = next(routes(config))
-    unknown = synthetic_event(config, route)
+    unknown = synthetic_event(config, route, source=source)
     unknown["data"]["essentials"]["alertRule"] = "__untrusted_synthetic_rule__"
-    stale = synthetic_event(config, route)
+    stale = synthetic_event(config, route, source=source)
     stale["data"]["essentials"]["firedDateTime"] = "2000-01-01T00:00:00Z"
-    wrong_deployment = synthetic_event(config, route)
+    wrong_deployment = synthetic_event(config, route, source=source)
     wrong_deployment["data"]["alertContext"]["condition"]["allOf"][0]["dimensions"][0]["value"] = "__untrusted_deployment__"
     for event in (unknown, stale, wrong_deployment):
         try:
@@ -396,9 +411,9 @@ def rejection_checks(config, callback):
     return 3
 
 
-def synthetic_event(config, route, condition="Fired"):
+def synthetic_event(config, route, condition="Fired", source="metric"):
     now = stamp()
-    return {
+    event = {
         "schemaId": "azureMonitorCommonAlertSchema",
         "data": {
             "essentials": {
@@ -416,6 +431,28 @@ def synthetic_event(config, route, condition="Fired"):
             }]}},
         },
     }
+    if source == "apim_logs":
+        logs = config["apim_log_alerts"]
+        event["data"]["essentials"].update({
+            "alertRule": route["log_alert_name"], "signalType": "Log",
+            "monitoringService": "Log Alerts V2", "alertTargetIDs": [logs["workspace_resource_id"]],
+        })
+        event["data"]["alertContext"] = {
+            "conditionType": "LogQueryCriteria",
+            "condition": {"windowSize": logs["window_size"], "windowEndTime": now, "allOf": [{
+                "searchQuery": log_query(config, route), "metricMeasureColumn": "BackendLatencyP95Ms",
+                "operator": "GreaterThan", "timeAggregation": "Maximum",
+                "threshold": logs["threshold_ms"],
+                "metricValue": logs["threshold_ms"] + 1 if condition == "Fired" else 0,
+                "dimensions": [{"name": "BackendId", "value": route["backend_id"]}],
+                "failingPeriods": {"numberOfEvaluationPeriods": 1, "minFailingPeriodsToAlert": 1},
+            }]},
+        }
+    return event
+
+
+def alert_sources(config):
+    return ("metric", "apim_logs") if "apim_log_alerts" in config else ("metric",)
 
 
 def smoke(config, azure, receipt):
@@ -428,9 +465,11 @@ def smoke(config, azure, receipt):
     preflight(config, azure)
     principal_id, workflow, policy_hash, callback = check_controller(config, azure)
     check_alerts(config, azure, disabled=True)
-    rejected = rejection_checks(config, callback)
+    rejected = sum(rejection_checks(config, callback, source) for source in alert_sources(config))
     completed = []
-    for group, spec in config["groups"].items():
+    for group, spec, source in (
+            (group, spec, source) for source in alert_sources(config)
+            for group, spec in config["groups"].items()):
         original, original_headers = azure.call("GET", named_id(config, group))
         check_named(config, group, original)
         original_value = original["properties"]["value"]
@@ -461,7 +500,7 @@ def smoke(config, azure, receipt):
                             degraded_backend_names.append(route["backend_name"])
                         candidate = ",".join(degraded_backend_names)
                     try:
-                        status, result = invoke_callback(callback, synthetic_event(config, route, condition))
+                        status, result = invoke_callback(callback, synthetic_event(config, route, condition, source))
                     except CallbackPending as pending:
                         # Only resume the existing response poll; never resend
                         # a Fired event or restore while its outcome is unknown.
@@ -491,7 +530,7 @@ def smoke(config, azure, receipt):
                     elif possible:
                         ensure(observed == possible, "Concurrent ETag change after controller write")
                     confirmed, possible = observed, None
-                    completed.append({"group": group, "route": route["backend_name"],
+                    completed.append({"group": group, "route": route["backend_name"], "source": source,
                                       "condition": condition, "outcome": outcome})
         except AzureError as error:
             unsettled = error.uncertain
@@ -537,14 +576,14 @@ def enable_alerts(config, azure, receipt):
            and evidence.get("principal_id") == principal_id
            and evidence.get("workflow_changed_time") == workflow.get("properties", {}).get("changedTime")
            and evidence.get("policy_sha256") == policy_hash
-           and evidence.get("rejection_checks") == 3
-           and len(evidence.get("checks", [])) == 12,
+           and evidence.get("rejection_checks") == 3 * len(alert_sources(config))
+           and len(evidence.get("checks", [])) == 12 * len(alert_sources(config)),
            "Smoke receipt is stale or mismatched; run smoke again with alerts disabled")
     enabled = []
     try:
-        for _, route in routes(config):
-            azure.call("PATCH", alert_id(config, route), {"properties": {"enabled": True}}, version=ALERT_VERSION)
-            enabled.append(route["alert_name"])
+        for resource, _, version in alert_resources(config):
+            azure.call("PATCH", resource, {"properties": {"enabled": True}}, version=version)
+            enabled.append(resource.rsplit("/", 1)[-1])
     except AzureError:
         # Best-effort fail closed; failures here remain explicit to the operator.
         disable_alerts(config, azure, missing_ok=True)

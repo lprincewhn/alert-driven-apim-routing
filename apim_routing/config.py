@@ -68,7 +68,7 @@ def validate(data):
     keys(data, ("subscription_id", "controller_resource_group", "location",
                 "workflow_name", "action_group_name", "action_group_short_name",
                 "apim_resource_id", "api_id", "uami_client_id", "groups"),
-         ("threshold_ms", "window_size", "evaluation_frequency"))
+         ("threshold_ms", "window_size", "evaluation_frequency", "apim_log_alerts"))
     guid(data["subscription_id"], "subscription_id")
     guid(data["uami_client_id"], "uami_client_id")
     for key in ("controller_resource_group", "workflow_name", "action_group_name", "api_id"):
@@ -88,6 +88,25 @@ def validate(data):
                 key + " must be one of: " + ", ".join(choices))
     require(EVALUATION_MINUTES[data["evaluation_frequency"]] <= WINDOW_MINUTES[data["window_size"]],
             "evaluation_frequency must not exceed window_size")
+    if "apim_log_alerts" in data:
+        logs = data["apim_log_alerts"]
+        keys(logs, ("workspace_resource_id", "location"),
+             ("threshold_ms", "window_size", "evaluation_frequency", "min_samples"))
+        resource(logs["workspace_resource_id"], "Microsoft.OperationalInsights", "workspaces", "log workspace")
+        require(isinstance(logs["location"], str) and re.fullmatch(r"[a-z0-9]+", logs["location"]),
+                "apim_log_alerts.location must be the workspace Azure location code")
+        threshold = logs.setdefault("threshold_ms", 2000)
+        require(type(threshold) in (int, float) and math.isfinite(threshold) and 0 < threshold <= 86400000,
+                "apim_log_alerts.threshold_ms must be a finite positive number no greater than one day")
+        samples = logs.setdefault("min_samples", 20)
+        require(type(samples) is int and 1 <= samples <= 1000000,
+                "apim_log_alerts.min_samples must be an integer between 1 and 1000000")
+        for key, choices in (("window_size", WINDOW_MINUTES), ("evaluation_frequency", EVALUATION_MINUTES)):
+            value = logs.setdefault(key, "PT5M")
+            require(isinstance(value, str) and value in choices and choices[value] >= 5,
+                    "apim_log_alerts." + key + " must be a supported duration of at least five minutes")
+        require(EVALUATION_MINUTES[logs["evaluation_frequency"]] <= WINDOW_MINUTES[logs["window_size"]],
+                "apim_log_alerts.evaluation_frequency must not exceed window_size")
     keys(data["groups"], ("chat", "embedding"))
     alerts, named = [], []
     for group, spec in data["groups"].items():
@@ -98,7 +117,11 @@ def validate(data):
         backend_names, backends, deployments = [], [], []
         for route in spec["routes"]:
             keys(route, ("backend_id", "foundry_resource_id", "deployment_name", "alert_name"),
-                 ("backend_name", "token"))
+                 ("backend_name", "token", "log_alert_name"))
+            require(("log_alert_name" in route) == ("apim_log_alerts" in data),
+                    "log_alert_name on every route requires apim_log_alerts and vice versa")
+            if "log_alert_name" in route:
+                alerts.append(name(route["log_alert_name"], "log_alert_name"))
             require(("backend_name" in route) != ("token" in route),
                     "Specify exactly one of backend_name or legacy token")
             # Normalize the legacy input only; all generated artifacts use backend_name.
@@ -120,7 +143,8 @@ def validate(data):
         require(len(set(deployments)) == 1,
                 "Both routes in a group must use the same deployment name (request path is unchanged)")
     require(len(set(named)) == 2, "Named value names must be distinct")
-    require(len(set(alerts)) == 4, "Alert names must be globally distinct")
+    require(len({value.lower() for value in alerts}) == len(alerts),
+            "Alert names must be globally distinct")
     return data
 
 
@@ -151,6 +175,28 @@ def alert_id(config, route):
     return root(config) + "/providers/Microsoft.Insights/metricAlerts/" + route["alert_name"]
 
 
+def log_alert_id(config, route):
+    return root(config) + "/providers/Microsoft.Insights/scheduledQueryRules/" + route["log_alert_name"]
+
+
+def log_query(config, route):
+    # All interpolated identifiers are restricted by validate; no arbitrary KQL input.
+    return "\n".join((
+        "ApiManagementGatewayLogs",
+        f"| where _ResourceId =~ '{config['apim_resource_id']}'",
+        f"| where ApiId == '{config['api_id']}'",
+        f"| where BackendId == '{route['backend_id']}'",
+        "| where BackendMethod == 'POST'",
+        "| extend BackendPath = tostring(parse_url(BackendUrl).Path)",
+        f"| where BackendPath in ('/openai/deployments/{route['deployment_name']}/chat/completions', "
+        f"'/openai/deployments/{route['deployment_name']}/embeddings')",
+        "| where isnotnull(BackendTime) and BackendTime > 0 and BackendResponseCode > 0",
+        "| summarize SampleCount = count(), BackendLatencyP95Ms = percentile(BackendTime, 95) by BackendId",
+        f"| where SampleCount >= {config['apim_log_alerts']['min_samples']}",
+        "| project BackendId, BackendLatencyP95Ms",
+    ))
+
+
 def routes(config):
     for group in ("chat", "embedding"):
         for route in config["groups"][group]["routes"]:
@@ -158,7 +204,7 @@ def routes(config):
 
 
 def rule_map(config):
-    return {
+    mapping = {
         route["alert_name"]: {
             "route": group + "-" + route["backend_name"], "group": group,
             "backend_name": route["backend_name"], "account": route["foundry_resource_id"].lower(),
@@ -166,6 +212,14 @@ def rule_map(config):
             "backend_names": [item["backend_name"] for item in config["groups"][group]["routes"]],
         } for group, route in routes(config)
     }
+    if "apim_log_alerts" in config:
+        for _, route in routes(config):
+            mapping[route["log_alert_name"]] = {
+                **mapping[route["alert_name"]], "source": "apim_logs",
+                "account": config["apim_log_alerts"]["workspace_resource_id"].lower(),
+                "backend_id": route["backend_id"], "query": log_query(config, route),
+            }
+    return mapping
 
 
 def digest(config):
