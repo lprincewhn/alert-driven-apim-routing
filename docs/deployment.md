@@ -213,6 +213,63 @@ az rest --method put --subscription "$SUB" \
 
 **本步完成条件：**正式配置有历史数据依据，Action Group 指向预期工作流，四条规则正确且尚未启用。
 
+## 可选：新增 APIM 诊断日志后端时延 p95 告警
+
+以下是在原四条 Foundry 告警之外新增一套规则；不替换原规则、不修改 APIM 策略。先按前五步准备现有控制链路。无 `apim_log_alerts` 配置时行为不变。
+
+### 采集前置条件
+
+准备已有 Log Analytics workspace，配置 APIM Azure Monitor 诊断设置，将 `GatewayLogs` 发往该 workspace，使用 **Resource specific / Dedicated** 模式。表必须为 `ApiManagementGatewayLogs`，使用支持此日志告警查询的 **Analytics** 表计划；当前不支持旧 `AzureDiagnostics` 或 Basic 表方案。项目不自动创建 workspace、开启诊断、修改日志计划或采样比例。
+
+等待真实日志摄取后，确认目标 API 的各后端均有 `BackendId`、`BackendTime`（毫秒）、`BackendUrl`、`ApiId` 等字段；BackendId 应与配置 `backend_id` 一致。不要为本方案启用请求/响应正文或认证头采集。结合采样比例、摄取延迟、重试和流式响应确认数据可归因；缺字段时先修复采集，不跳过查询验证。创建者需要 workspace 查询及日志告警写入权限；Logic App 系统身份仍只需原两份 Named Value 权限。
+
+### 独立配置与生成
+
+在未提交的 `config.local.json` 根节点加入：
+
+```json
+{
+  "apim_log_alerts": {
+    "workspace_resource_id": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/replace-logs-rg/providers/Microsoft.OperationalInsights/workspaces/replace-existing-workspace",
+    "location": "replacewithworkspacelocation",
+    "threshold_ms": 2000,
+    "window_size": "PT5M",
+    "evaluation_frequency": "PT5M",
+    "min_samples": 20
+  }
+}
+```
+
+这是需合并到已有配置的片段，不是完整配置。每条 route 同时新增唯一 `log_alert_name`，例如分别为 `replace-chat-a-p95`、`replace-chat-b-p95`、`replace-embedding-c-p95`、`replace-embedding-d-p95`；保留原 `alert_name`。八个名称必须全局唯一（忽略大小写）。
+
+workspace ID 和其实际区域必填；其余字段省略时采用上例默认值。p95 阈值独立于根节点 Foundry `threshold_ms`，必须为有限正数且不超过 86400000 ms。`min_samples` 是每个后端每个评估窗口的有效记录数，范围 1–1000000；建议根据代表性历史日志确定阈值与门槛，不直接复用 TTLT 平均值阈值。
+
+日志窗口可选 `PT5M`、`PT15M`、`PT30M`、`PT1H`、`PT6H`、`PT12H`、`P1D`；评估频率可选 `PT5M`、`PT10M`、`PT15M`、`PT30M`、`PT1H`，不得大于窗口。本实现有意不支持一分钟日志评估，避免一分钟查询限制和采集延迟造成误解。窗口由 Scheduled Query Rule 施加到 `TimeGenerated`，生成的 KQL 不另行固定 `ago(...)`。
+
+重新运行第二步离线命令。`alerts.json` 现在包含八条禁用规则；`manifest.json.alert_api_versions` 给出每条资源的正确 API 版本；`workflow.json` 包含八个静态映射。从每条日志规则取出 `properties.criteria.allOf[0].query`，在目标 workspace 选择与窗口一致的时间范围执行，确认只返回目标后端的 `BackendId` 与 `BackendLatencyP95Ms`；无数据或有效样本不足应返回零行，而不是 p95=0。
+
+### 分别发布和验收
+
+1. 暂停原四条及任何已存在的日志规则，禁用工作流并排空运行。保留原名单、ETag、工作流身份、Webhook 及 Action Group，不重装策略、不清空名单。
+2. 按第四步独立更新工作流 definition。标准部署映射检查允许从四条扩为八条，但不允许直接删除/重命名已有规则，避免遗留启用的孤立规则。
+3. 按第五步逐条创建四条日志规则，确认 `enabled=false`；日志资源不是 `metricAlerts`，请求结构如下。复用外部 Action Group 时应修改 `properties.actions.actionGroups` 数组，不能沿用指标规则的 `actions[].actionGroupId` 格式。
+
+```bash
+# NAME 每次选择一个已审核的 log_alert_name；SUB/RG 仍为控制资源订阅和资源组。
+RID="/subscriptions/$SUB/resourceGroups/$RG/providers/Microsoft.Insights/scheduledQueryRules/$NAME"
+BODY=$(jq -ec --arg id "$RID" '.[$id] // error("Alert not found")' ./rendered/alerts.json) &&
+az rest --method put --subscription "$SUB" \
+  --url "https://management.azure.com$RID?api-version=2023-12-01" \
+  --headers Content-Type=application/json --body "$BODY" \
+  --query '{name:name,enabled:properties.enabled,scopes:properties.scopes}' -o json
+```
+
+4. 核对 workspace scope、区域、查询、样本门槛、BackendId 维度、`metricMeasureColumn=BackendLatencyP95Ms`、`timeAggregation=Maximum`、阈值、窗口和 Common Alert Schema 接收器。查询在整个窗口计算一次 p95，Maximum 只是读取该单值；不要改为 Count 或对小窗口 p95 求平均。
+5. 标准路径的 `smoke` 现在覆盖两种来源，共 24 次通知、6 次拒绝检查，并分别临时修改/恢复名单；原 12 次检查的 receipt 不能启用八条规则。`disable-alerts`、`enable-alerts` 和保留的 `deploy` 命令都处理全部配置规则及各自 API 版本，但部署仍推荐本文的逐资源发布方式。
+6. 按第六步在授权窗口单独演练四条日志规则：临时降低 `apim_log_alerts.threshold_ms` 并同步工作流，原生指标规则保持禁用以隔离证据。向指定候选发送预算内请求，满足 `min_samples` 后等待日志摄取。验证实际 KQL p95 严格越阈值 → Log Alerts V2 Fired → 正确组名单更新 → 钉钉显示“APIM 后端时延 p95” → 后续选路变化；重复事件幂等，Resolved（包括无数据恢复）不清名单。恢复正式配置后重新验收，再按计划逐条启用两类规则。
+
+回滚日志功能时先禁用/按需删除四条日志规则，排空工作流，再恢复旧定义和旧配置；仅删除本地 `apim_log_alerts` 不能停掉云端规则。手动恢复某后端时必须同时暂停对应两种来源，否则另一规则可能继续降级。不要把无数据或样本不足造成的 Resolved 当作后端恢复证据。
+
 ## 6. 临时调低阈值，触发真实告警完成闭环验证
 
 **仅在获授权的维护窗口执行。** 通知业务及钉钉接收方，设置请求数、费用、最长等待时间和中止条件。记录正式配置、阈值、窗口、各告警启用状态、工作流版本、名单及 ETag。这一步会产生真实推理费用、告警、名单变更和通知。

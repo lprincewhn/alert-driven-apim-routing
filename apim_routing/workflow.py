@@ -52,7 +52,7 @@ def http_action(method, body=None, headers=None):
     return {"type": "Http", "inputs": inputs}
 
 
-def alert_schema():
+def alert_schema(include_logs=False):
     string = {"type": "string", "minLength": 1}
     numeric = {"type": ["number", "string"]}
     essentials = {
@@ -75,6 +75,21 @@ def alert_schema():
             },
         },
     }
+    criterion_schema = {"type": "object", "required": list(criterion), "properties": criterion}
+    if include_logs:
+        log_criterion = {
+            key: value for key, value in criterion.items()
+            if key not in ("metricName", "metricNamespace")
+        }
+        log_criterion.update({
+            "searchQuery": string, "metricMeasureColumn": string,
+            "metricValue": {"type": ["number", "string", "null"]},
+        })
+        criterion_schema = {"anyOf": [
+            criterion_schema,
+            {"type": "object", "required": [key for key in log_criterion if key != "metricValue"],
+             "properties": log_criterion},
+        ]}
     return {
         "type": "object", "required": ["schemaId", "data"],
         "properties": {
@@ -95,10 +110,7 @@ def alert_schema():
                                 "properties": {
                                     "allOf": {
                                         "type": "array", "minItems": 1, "maxItems": 1,
-                                        "items": {
-                                            "type": "object", "required": list(criterion),
-                                            "properties": criterion,
-                                        },
+                                        "items": criterion_schema,
                                     },
                                 },
                             },
@@ -111,10 +123,10 @@ def alert_schema():
 
 
 def definition(config):
-    """Return a secret-free WDL definition with four immutable trusted mappings.
+    """Return a secret-free WDL definition with immutable trusted mappings.
 
-    Fired alerts require TTLT above the configured threshold and a fired time within -30/+2 minutes.
-    Resolved alerts validate the same metric identity, deployment and threshold,
+    Fired alerts require the configured latency threshold and a fired time within -30/+2 minutes.
+    Resolved alerts validate the same signal identity, route and threshold,
     but allow recovered latency and use resolvedDateTime for freshness; their
     firedDateTime must not follow resolvedDateTime. Neither event accepts extra
     criteria, targets or dimensions.
@@ -143,6 +155,36 @@ def definition(config):
         f"lessOrEquals(ticks({event_time}), ticks(addMinutes(utcNow(), 2))), "
         f"lessOrEquals(ticks({essentials}?['firedDateTime']), ticks({event_time})))"
     )
+    metric_value = f"float({criterion}?['metricValue'])"
+    if "apim_log_alerts" in config:
+        context = "body('Parse_alert')?['data']?['alertContext']"
+        threshold = config["apim_log_alerts"]["threshold_ms"]
+        # No-data recovery can omit metricValue/resolvedDateTime. Use the
+        # evaluation end time only for log recovery; never for Fired freshness.
+        log_time = (
+            f"if({fired}, {essentials}?['firedDateTime'], "
+            f"coalesce({essentials}?['resolvedDateTime'], {context}?['condition']?['windowEndTime']))"
+        )
+        log_valid = (
+            f"and(equals({essentials}?['signalType'], 'Log'), "
+            f"equals({essentials}?['monitoringService'], 'Log Alerts V2'), "
+            f"equals({context}?['conditionType'], 'LogQueryCriteria'), "
+            f"equals(toLower(first({essentials}?['alertTargetIDs'])), outputs('Match_rule')?['account']), "
+            f"equals({criterion}?['searchQuery'], outputs('Match_rule')?['query']), "
+            f"equals({criterion}?['metricMeasureColumn'], 'BackendLatencyP95Ms'), "
+            f"equals({criterion}?['operator'], 'GreaterThan'), "
+            f"equals({criterion}?['timeAggregation'], 'Maximum'), "
+            f"equals(float({criterion}?['threshold']), {threshold}), "
+            f"greaterOrEquals(float(coalesce({criterion}?['metricValue'], 0)), 0), "
+            f"or(not({fired}), greater(float(coalesce({criterion}?['metricValue'], 0)), {threshold})), "
+            f"equals(first({criterion}?['dimensions'])?['name'], 'BackendId'), "
+            f"equals(first({criterion}?['dimensions'])?['value'], outputs('Match_rule')?['backend_id']), "
+            f"greaterOrEquals(ticks({log_time}), ticks(addMinutes(utcNow(), -30))), "
+            f"lessOrEquals(ticks({log_time}), ticks(addMinutes(utcNow(), 2))), "
+            f"lessOrEquals(ticks({essentials}?['firedDateTime']), ticks({log_time})))"
+        )
+        valid = f"@if(equals(outputs('Match_rule')?['source'], 'apim_logs'), {log_valid}, {valid[1:]})"
+        metric_value = f"coalesce({criterion}?['metricValue'], 'no data')"
     config_valid = (
         "@and(equals(body('Read_routes')?['properties']?['secret'], false), "
         "equals(toLower(body('Read_routes')?['id']), toLower(outputs('Match_rule')?['namedValue'])), "
@@ -234,7 +276,7 @@ def definition(config):
         Save_route=set_value("Route", "@outputs('Match_rule')?['route']"),
         Save_group=set_value("Group", "@outputs('Match_rule')?['group']"),
         Save_backend_name=set_value("backend_name", "@outputs('Match_rule')?['backend_name']"),
-        Save_metric=set_value("Metric", f"@string(float({criterion}?['metricValue']))"),
+        Save_metric=set_value("Metric", f"@string({metric_value})"),
         Accept_event=set_value("Accepted", True),
         Accept_status=set_value("StatusCode", 200),
         Fired_only=condition(
@@ -248,7 +290,7 @@ def definition(config):
         "actions": sequence(
             Parse_alert={
                 "type": "ParseJson",
-                "inputs": {"content": "@triggerBody()", "schema": alert_schema()},
+                "inputs": {"content": "@triggerBody()", "schema": alert_schema("apim_log_alerts" in config)},
             },
             Rule_map={"type": "Compose", "inputs": rule_map(config)},
             Trusted_rule=condition(
@@ -299,7 +341,8 @@ def definition(config):
                                "if(equals(variables('Outcome'), 'ResolvedIgnored'), '告警已恢复，保留降级标记，需人工恢复路由', "
                                "if(equals(variables('Outcome'), 'ControllerFailed'), '路由控制器处理失败，请检查权限、ETag 和运行记录', "
                                "variables('Outcome'))))), decodeUriComponent('%0A'), "
-                               "'平均总响应时延（TTLT）：', variables('Metric'), ' 毫秒', "
+                               "if(equals(outputs('Match_rule')?['source'], 'apim_logs'), "
+                               "'APIM 后端时延 p95：', '平均总响应时延（TTLT）：'), variables('Metric'), ' 毫秒', "
                                "if(empty(variables('Before')), '', concat(decodeUriComponent('%0A'), "
                                "'变更前降级名单：', if(equals(variables('Before'), 'none'), '无', variables('Before')))), "
                                "if(empty(variables('After')), '', concat(decodeUriComponent('%0A'), "

@@ -2,13 +2,13 @@
 
 **Azure Monitor 告警触发 Logic Apps，更新已有 Azure API Management 的路由优先级。**
 
-本项目把 Foundry 原生时延告警转换为 APIM Named Value 的状态变化。聊天和 Embedding 各维护一份 **degraded（降级）名单**：首次请求优先正常后端，遇到 429/5xx 仍可重试降级后端。降级不是屏蔽。
+本项目把 Foundry 原生时延告警，以及可选的 **APIM 诊断日志后端时延 p95 告警**，转换为 APIM Named Value 的状态变化。聊天和 Embedding 各维护一份 **degraded（降级）名单**：首次请求优先正常后端，遇到 429/5xx 仍可重试降级后端。降级不是屏蔽。
 
 ## 方案边界
 
 - **Bring your own APIM**：引用现有 APIM、API、操作、backend 和用户分配托管身份；不创建 APIM。
 - Foundry 账户和模型部署也是外部资源；不创建或扩容模型，不替调用方决定区域与配额。
-- 本项目负责控制器、Action Group、四条模型时延告警和两份降级名单，并提供可显式安装的 API 策略。
+- 本项目负责控制器、Action Group、四条模型时延告警和两份降级名单，并提供可显式安装的 API 策略；启用 `apim_log_alerts` 后额外生成四条日志告警，不替换原有告警。
 - 订阅、资源组、资源 ID、后端 ID、模型部署名称、路由标识和通知凭据均由操作者提供。源码不包含任何实验环境配置。
 - 不是 APIM 原生负载均衡池或断路器；不执行主动健康探测，不自动恢复，不承诺自动补偿漏投事件。
 
@@ -32,6 +32,8 @@
 ```
 
 默认告警阈值 **2,000 ms**。省略窗口/频率时，按 **1 分钟平均值**判断、每分钟评估一次；配置示例演示 **5 分钟窗口、1 分钟评估间隔**。使用 `window_size` 和 `evaluation_frequency` 选择时长，评估间隔不能大于窗口，可选值见部署文档。指标是 Foundry 原生 TTLT，不是客户端端到端耗时，也不是首 token 时延。
+
+可选日志规则在已有 Log Analytics workspace 的 `ApiManagementGatewayLogs` 中，按 APIM、API、实际 `BackendId` 和部署路径筛选，对窗口内 `BackendTime`（ms）计算 `percentile(..., 95)`。独立默认值为 **2000 ms、5 分钟窗口 / 5 分钟评估、至少 20 个有效样本**；无数据或样本不足不触发。配置与分步发布见[日志告警部署](docs/deployment.md#可选新增-apim-诊断日志后端时延-p95-告警)。不会自动创建 workspace 或修改 APIM 诊断设置。
 
 ## 路由行为
 

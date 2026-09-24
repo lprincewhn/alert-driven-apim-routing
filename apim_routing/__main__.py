@@ -31,7 +31,7 @@ def parser():
     enable = commands.add_parser("enable-alerts", help="Enable only after role, policy and recent smoke checks")
     enable.add_argument("--confirm", required=True, action="store_true")
     enable.add_argument("--smoke-receipt", required=True)
-    commands.add_parser("disable-alerts", help="Disable the four existing metric alerts")
+    commands.add_parser("disable-alerts", help="Disable all configured metric and APIM log alerts")
     return result
 
 

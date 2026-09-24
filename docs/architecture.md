@@ -2,7 +2,7 @@
 
 ## 目标与外部依赖
 
-目标是把模型部署的**原生时延告警**变为 APIM 的**后续请求路由优先级变化**，而不是在 Logic App 中代理推理请求。
+目标是把模型部署的**原生时延告警**及可选的 **APIM 诊断日志后端时延 p95 告警**变为 APIM 的**后续请求路由优先级变化**，而不是在 Logic App 中代理推理请求。
 
 APIM 服务、API 操作、backend、用户分配托管身份、Foundry 账户和模型部署由外部管理。本项目引用它们，不创建 APIM、不改模型容量、不修改 backend URL。控制资源与 APIM 可以位于不同资源组；跨订阅引用是否支持，以配置校验和部署权限为准，不能假定当前登录身份拥有目标权限。
 
@@ -76,9 +76,25 @@ Fired 事件要求指标大于相应阈值，时间位于过去 30 分钟至未�
 
 配置变更必须同步规则与控制器，否则白名单/阈值校验会拒绝事件。
 
+## 可选 APIM 日志契约
+
+`apim_log_alerts` 存在时额外生成四条 `Microsoft.Insights/scheduledQueryRules`（API `2023-12-01`），每条绑定一个已有 route；未配置时仍仅生成原有四条 Foundry 告警。两种来源共用 Action Group、ETag 并集写入和钉钉通知；任一有效 Fired 都可降级，Resolved 均不移除名单。
+
+只支持资源专用表 `ApiManagementGatewayLogs`，不把旧 `AzureDiagnostics` 列名混入查询。查询以 `_ResourceId`、`ApiId`、`BackendId`、POST 和确切部署路径隔离候选；只统计 `BackendTime > 0` 且有后端响应码的记录，不将缓存命中、缺值、零耗时或无后端响应当成健康样本。有响应的 429/5xx 不因失败状态被排除。每条规则在其评估窗口内产生单个后端的 `BackendLatencyP95Ms`，只在 `SampleCount >= min_samples` 时返回结果，不按小时间桶先求 p95 再平均。规则的 `Maximum` 只是读取这一个 p95 值，不是把后端时延取最大值。
+
+日志 scope 是 workspace，事件契约为 `signalType=Log`、`monitoringService=Log Alerts V2`、`conditionType=LogQueryCriteria`。控制器校验受信规则名、workspace、完整生成查询、`metricMeasureColumn`、`Maximum`、阈值和唯一 `BackendId` 维度，再映射到对应组/名单；不使用事件中的 URL 进行查询或更新。Fired 必须严格大于阈值且在新鲜度窗口内。Resolved 可以为 null 测量值；缺少恢复时间时使用评估窗口结束时间判断新鲜度，不恢复路由。原有 Metric/Platform 的 TTLT 校验保持独立，不能互换规则名绕过来源校验。
+
+`BackendTime` 是网关记录的后端耗时，不等于 TTLT、客户端端到端耗时或首 token 时延。网关诊断记录不保证每次跨后端重试分别提供一条可归因记录，不能从最终 `BackendId` 推断第一次尝试的时延；流式长响应也有不同测量边界。上线前必须用实际网关记录确认 BackendId、耗时单位、重试和流式行为。若日志缺少 BackendId，本实现不回退按 URL 猜测后端，应先解决采集兼容性。
+
+日志摄取延迟、采样和低流量均会影响 p95 与告警速度；诊断/查询和告警也会增加费用。样本不足或数据中断不是健康证明，必要时另设采集可用性告警。无需给控制器身份增加日志读取权限；日志采集、workspace/table 访问和告警查询权限由操作者按 Azure Monitor 要求独立准备。
+
+参考：[表结构](https://learn.microsoft.com/en-us/azure/azure-monitor/reference/tables/apimanagementgatewaylogs)、[Scheduled Query Rules](https://learn.microsoft.com/en-us/azure/templates/microsoft.insights/2023-12-01/scheduledqueryrules)、[Log Alerts V2 Common Alert Schema](https://learn.microsoft.com/en-us/azure/azure-monitor/alerts/alerts-common-schema#sample-log-search-alert-when-the-monitoringservice--log-alerts-v2)。
+
 ## 通知与失败
 
-钉钉通知使用中文，包含 `Azure`、业务类型、区域、处理结果、平均总响应时延（毫秒）和可获得的名单前后值。更新成功、重复降级、告警恢复但不自动恢复路由、控制器失败分别给出中文说明；区域标识和错误代码保留原值便于排查。生成的 JSON 使用 UTF-8 可读中文，不转换为 Unicode 转义序列。HTTP 响应中的机器状态码保持不变。仅在 HTTP 成功且业务 `errcode=0` 时认定通知成功。
+钉钉通知使用中文，包含 `Azure`、业务类型、逻辑后端名称、处理结果和可获得的名单前后值。时延根据来源明确标为“平均总响应时延（TTLT）”或“APIM 后端时延 p95”，单位为毫秒；无数据的日志恢复事件显示 `no data`，不会伪报 0 ms。
+
+更新成功、重复降级、告警恢复但不自动恢复路由、控制器失败分别给出中文说明；区域标识和错误代码保留原值便于排查。生成的 JSON 使用 UTF-8 可读中文，不转换为 Unicode 转义序列。HTTP 响应中的机器状态码保持不变。仅在 HTTP 成功且业务 `errcode=0` 时认定通知成功。
 
 | 名单写入 | 通知 | 结果 |
 |---|---|---|
