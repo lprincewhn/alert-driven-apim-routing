@@ -38,11 +38,11 @@ test ! -e config.local.json && cp examples/config.example.json config.local.json
 
 同组两个成员的模型部署名必须相同，因为策略不改写部署名。Embedding 部署名必须包含小写 `embedding`，聊天部署名不能包含它；不满足时需先调整并审阅分类策略。backend 必须指向对应 Foundry 的 HTTPS 根端点，不能附加路径或冲突的 API key/Authorization 凭据。APIM UAMI 必须已有各 Foundry 账户的推理权限。
 
-`backend_name` 是组内唯一的稳定逻辑后端名称，必须与 Named Value 中的名单成员一致；它不是 APIM backend 资源名称，也不要求等于 Azure 区域。`backend_id` 才指向实际 APIM backend。已有名单需核对语义：本方案是 **degraded（降级）名单**，不是旧版 enabled（可用）名单。
+`backend_name` 是组内唯一的稳定逻辑后端名称，必须与 Named Value 中的名单成员一致；它不是 APIM backend 资源名称，也不要求等于 Azure 区域。`backend_id` 才指向实际 APIM backend。Named Value 保存 **degraded（降级）名单**：`none` 表示没有降级成员，逗号分隔的后端名称表示已降级成员。
 
-旧配置的 `token` 暂作为兼容别名接受，加载时归一化为 `backend_name`；同一条 route 不允许同时填写两者，即使值相同。新配置只使用 `backend_name`，重命名字段时保持现有名单成员值不变。生成的 workflow 使用 `backend_name`、`backend_names` 和 `degraded_backend_names`，policy 使用 `backend_name` / `backend_names`。部署前映射检查兼容旧 workflow 的 `region` / `allowed`，但仍拒绝实际成员或名单映射变更。固定 APIM 属性 `backend-id` 不变，响应头 `X-Backend-Region` 为客户端兼容保留，其值仍为逻辑后端名称；工作流的 `route` 响应字段及状态码不变。
+配置按示例使用 `backend_name`。生成的 workflow 使用 `backend_name`、`backend_names` 和 `degraded_backend_names`，policy 使用 `backend_name` / `backend_names`。APIM 策略属性 `backend-id` 指向实际后端，响应头 `X-Backend-Region` 返回逻辑后端名称；工作流的 `route` 响应字段为 `<组名>-<backend_name>`。
 
-字段迁移后需重新生成、审阅并分别发布 policy 与 workflow；更新 workflow 时仍须暂停告警、排空运行并保留原身份和安全参数，不能仅修改线上 JSON 字段。旧 smoke receipt 不应复用，应在迁移后的配置和定义下重新验证。
+部署前核对配置、两份名单、policy 与 workflow 的后端映射一致。修改配置后需重新生成、审阅并分别发布相关定义；更新 workflow 时须暂停告警、排空运行并保留原身份和安全参数，不能仅修改线上 JSON 字段。smoke receipt 必须对应当前配置和工作流状态。
 
 **本步完成条件：**配置中的资源确实存在、模型部署就绪、身份及路径匹配；不只是在 JSON 中填完字符串。
 
@@ -70,7 +70,7 @@ python3 -B -m apim_routing --config config.local.json render --output-dir render
 
 ### 维护窗口与备份
 
-**这一步可能立即影响生产环境流量，不必等到告警启用才生效。** 事先通知业务负责人，约定维护窗口、验证请求预算、停止条件和回滚负责人。迁移已有链路时先暂停相关告警和自动写入者，排空工作流运行；不要与真实事故处置并行修改名单。
+**这一步可能立即影响生产环境流量，不必等到告警启用才生效。** 事先通知业务负责人，约定维护窗口、验证请求预算、停止条件和回滚负责人。更新已有链路时先暂停相关告警和自动写入者，排空工作流运行；不要与真实事故处置并行修改名单。
 
 保存当前 API policy、两份名单及 ETag、后端映射和告警状态到受限、未提交的目录。原策略可能含秘密。审核认证、配额、审计、操作级策略和继承关系；本模板会替换 API 级策略，不能自动合并，尤其 `backend` 段没有 `<base />`，不能假定父级 backend 逻辑仍会执行。
 
@@ -168,8 +168,8 @@ python3 -B -m apim_routing --config config.local.json grant-controller-roles
 **当前代码限制必须遵守：**
 
 - `threshold_ms` 是四条告警共用的正数；不支持直接配置四个独立阈值。
-- `window_size` 可选 `PT1M`、`PT5M`、`PT15M`、`PT30M`、`PT1H`、`PT6H`、`PT12H`、`P1D`；`evaluation_frequency` 可选 `PT1M`、`PT5M`、`PT10M`、`PT15M`、`PT30M`、`PT1H`。评估间隔不能大于窗口。两项省略时均默认 `PT1M`，保留旧配置行为；示例使用 `PT5M` / `PT1M`，表示每分钟评估最近五分钟的平均时延。
-- 配置文件继续使用 `window_size` / `evaluation_frequency`，生成的告警使用 Azure 的 `windowSize` / `evaluationFrequency`。这些选项参考 [Azure Monitor 静态指标告警模板](https://learn.microsoft.com/en-us/azure/azure-monitor/alerts/resource-manager-alerts-metric)，实际资源/指标限制仍以 Azure 返回为准。修改后重新生成并单独更新告警；只改 Portal 会造成配置漂移。工作流不校验这两个字段，仅调整窗口/频率无需更新其定义。
+- `window_size` 可选 `PT1M`、`PT5M`、`PT15M`、`PT30M`、`PT1H`、`PT6H`、`PT12H`、`P1D`；`evaluation_frequency` 可选 `PT1M`、`PT5M`、`PT10M`、`PT15M`、`PT30M`、`PT1H`。评估间隔不能大于窗口。两项省略时均默认 `PT1M`；示例使用 `PT5M` / `PT1M`，表示每分钟评估最近五分钟的平均时延。
+- 配置文件使用 `window_size` / `evaluation_frequency`，生成的告警使用 Azure 的 `windowSize` / `evaluationFrequency`。这些选项参考 [Azure Monitor 静态指标告警模板](https://learn.microsoft.com/en-us/azure/azure-monitor/alerts/resource-manager-alerts-metric)，实际资源/指标限制仍以 Azure 返回为准。修改后重新生成并单独更新告警；只改 Portal 会造成配置漂移。工作流不校验这两个字段，仅调整窗口/频率无需更新其定义。
 - 工作流要求事件中的 threshold 与生成值相等。正式阈值变化时先暂停告警、排空运行，同步更新配置、重新生成并单独更新工作流，再逐条更新禁用告警，不能只调告警规则。
 
 ### 先单独创建或确认 Action Group
@@ -192,7 +192,7 @@ properties.logicAppReceivers:
 
 **复用已有 Action Group（包括跨资源组）时，不修改其其他接收器。** 核对其启用状态、实际 Logic App 目标、回调和 Common Alert Schema，并评估所有接收器的通知影响。配置生成器默认把 Action Group 放在控制资源组；当前没有独立的外部 Action Group ID 配置项。若选用外部组，需在未提交的告警发布副本中把四条 `actions[].actionGroupId` 改为确认的完整 ID，审阅后发布并保留该差异记录。
 
-这类手工定制路径不能盲目重跑原 `deploy`、`smoke`、`enable-alerts`：它们按配置推导的工作流、Action Group、原始策略和告警定义进行写入或检查，可能覆盖绑定或因漂移失败。应先统一实现/配置，或使用审阅后的单资源命令并逐项完成等价验收；不要伪造 smoke receipt。
+这类手工定制路径不能盲目运行 `deploy`、`smoke`、`enable-alerts`：它们按配置推导的工作流、Action Group、模板策略和告警定义进行写入或检查，可能覆盖绑定或因漂移失败。应先统一实现/配置，或使用审阅后的单资源命令并逐项完成等价验收；不要伪造 smoke receipt。
 
 ### 每次只创建一条告警
 
